@@ -20,8 +20,8 @@ package org.apache.spark.network.shuffle;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
-import com.google.common.base.Preconditions;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.roaringbitmap.RoaringBitmap;
@@ -34,6 +34,8 @@ import org.apache.spark.network.protocol.Encoders;
  * 1. Number of chunks in a merged shuffle block.
  * 2. Bitmaps for each chunk in the merged block. A chunk bitmap contains all the mapIds that were
  *    merged to that merged block chunk.
+ *
+ * @since 3.1.0
  */
 public class MergedBlockMeta {
   private final int numChunks;
@@ -41,7 +43,7 @@ public class MergedBlockMeta {
 
   public MergedBlockMeta(int numChunks, ManagedBuffer chunksBitmapBuffer) {
     this.numChunks = numChunks;
-    this.chunksBitmapBuffer = Preconditions.checkNotNull(chunksBitmapBuffer);
+    this.chunksBitmapBuffer = Objects.requireNonNull(chunksBitmapBuffer);
   }
 
   public int getNumChunks() {

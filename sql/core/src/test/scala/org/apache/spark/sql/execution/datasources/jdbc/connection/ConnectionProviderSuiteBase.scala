@@ -20,14 +20,12 @@ package org.apache.spark.sql.execution.datasources.jdbc.connection
 import java.sql.{Driver, DriverManager}
 import javax.security.auth.login.Configuration
 
-import scala.collection.JavaConverters._
-
-import org.scalatest.BeforeAndAfterEach
+import scala.jdk.CollectionConverters._
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.execution.datasources.jdbc.{DriverRegistry, JDBCOptions}
 
-abstract class ConnectionProviderSuiteBase extends SparkFunSuite with BeforeAndAfterEach {
+abstract class ConnectionProviderSuiteBase extends SparkFunSuite {
   protected def registerDriver(driverClass: String): Driver = {
     DriverRegistry.register(driverClass)
     DriverManager.getDrivers.asScala.collectFirst {
@@ -59,16 +57,12 @@ abstract class ConnectionProviderSuiteBase extends SparkFunSuite with BeforeAndA
     // Make sure no authentication for the database is set
     assert(Configuration.getConfiguration.getAppConfigurationEntry(providerAppEntry) == null)
 
-    // Make sure the first call sets authentication properly
+    // Make sure setAuthenticationConfig call sets authentication properly
     val savedConfig = Configuration.getConfiguration
-    provider.setAuthenticationConfigIfNeeded(driver, options)
+    provider.setAuthenticationConfig(driver, options)
     val config = Configuration.getConfiguration
     assert(savedConfig != config)
     val appEntry = config.getAppConfigurationEntry(providerAppEntry)
     assert(appEntry != null)
-
-    // Make sure a second call is not modifying the existing authentication
-    provider.setAuthenticationConfigIfNeeded(driver, options)
-    assert(config.getAppConfigurationEntry(providerAppEntry) === appEntry)
   }
 }

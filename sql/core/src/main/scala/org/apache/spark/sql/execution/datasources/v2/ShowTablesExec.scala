@@ -20,15 +20,20 @@ package org.apache.spark.sql.execution.datasources.v2
 import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.encoders.RowEncoder
-import org.apache.spark.sql.catalyst.expressions.{Attribute, GenericRowWithSchema}
+import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.util.StringUtils
+import org.apache.spark.sql.connector.catalog.{CatalogV2Util, Identifier, RelationCatalog, TableCatalog}
 import org.apache.spark.sql.connector.catalog.CatalogV2Implicits.NamespaceHelper
-import org.apache.spark.sql.connector.catalog.TableCatalog
 import org.apache.spark.sql.execution.LeafExecNode
 
 /**
  * Physical plan node for showing tables.
+ *
+ * For a [[RelationCatalog]] (one that exposes both tables and views in a shared identifier
+ * namespace), this routes through [[RelationCatalog#listRelationSummaries]] so that views are
+ * included in the listing -- matching the v1 `SHOW TABLES` semantics where views appear
+ * alongside tables. Pure [[TableCatalog]] catalogs continue to use `listTables` and return
+ * tables only.
  */
 case class ShowTablesExec(
     output: Seq[Attribute],
@@ -37,18 +42,24 @@ case class ShowTablesExec(
     pattern: Option[String]) extends V2CommandExec with LeafExecNode {
   override protected def run(): Seq[InternalRow] = {
     val rows = new ArrayBuffer[InternalRow]()
-    val toRow = RowEncoder(schema).resolveAndBind().createSerializer()
 
-    val tables = catalog.listTables(namespace.toArray)
-    tables.map { table =>
-      if (pattern.map(StringUtils.filterPattern(Seq(table.name()), _).nonEmpty).getOrElse(true)) {
-        val result = new GenericRowWithSchema(
-          Array(table.namespace().quoted, table.name()),
-          schema)
-        rows += toRow(result).copy()
+    val identifiers: Array[Identifier] = catalog match {
+      case mc: RelationCatalog =>
+        mc.listRelationSummaries(namespace.toArray).map(_.identifier())
+      case _ => catalog.listTables(namespace.toArray)
+    }
+    identifiers.foreach { ident =>
+      if (pattern.map(StringUtils.filterPattern(Seq(ident.name()), _).nonEmpty).getOrElse(true)) {
+        rows += toCatalystRow(ident.namespace().quoted, ident.name(), isTempView(ident, catalog))
       }
     }
 
     rows.toSeq
+  }
+
+  private def isTempView(ident: Identifier, catalog: TableCatalog): Boolean = {
+    if (CatalogV2Util.isSessionCatalog(catalog)) {
+      session.sessionState.catalog.isTempView((ident.namespace() :+ ident.name()).toSeq)
+    } else false
   }
 }

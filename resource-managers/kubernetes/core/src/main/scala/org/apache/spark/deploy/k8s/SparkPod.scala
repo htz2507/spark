@@ -18,7 +18,17 @@ package org.apache.spark.deploy.k8s
 
 import io.fabric8.kubernetes.api.model.{Container, ContainerBuilder, Pod, PodBuilder}
 
-private[spark] case class SparkPod(pod: Pod, container: Container) {
+import org.apache.spark.annotation.{DeveloperApi, Since, Stable}
+
+/**
+ * :: DeveloperApi ::
+ *
+ * Represents a SparkPod consisting of pod and the container within the pod.
+ */
+@Stable
+@DeveloperApi
+@Since("2.4.0")
+case class SparkPod(pod: Pod, container: Container) {
 
   /**
    * Convenience method to apply a series of chained transformations to a pod.
@@ -38,6 +48,7 @@ private[spark] case class SparkPod(pod: Pod, container: Container) {
    * it can do matching without needing to exhaust all the possibilities. If the function
    * is not applied, then the original pod will be kept.
    */
+  @Since("3.0.0")
   def transform(fn: PartialFunction[SparkPod, SparkPod]): SparkPod = fn.lift(this).getOrElse(this)
 
 }

@@ -17,12 +17,25 @@
 
 package org.apache.spark.sql.execution.datasources.jdbc.connection
 
-import java.sql.Driver
+import java.sql.{Connection, Driver, DriverPropertyInfo, SQLException}
+import java.util.Properties
+import java.util.logging.Logger
 
 import org.apache.spark.sql.execution.datasources.jdbc.JDBCOptions
 
 class MSSQLConnectionProviderSuite extends ConnectionProviderSuiteBase {
-  test("setAuthenticationConfigIfNeeded default parser must set authentication if not set") {
+  test("appEntry unwraps reflected parser exceptions") {
+    val expected = new SQLException("parser failure")
+    val driver = new ThrowingParserDriver(expected)
+
+    val actual = intercept[SQLException] {
+      new MSSQLConnectionProvider().appEntry(driver, options("jdbc:sqlserver://localhost/mssql"))
+    }
+
+    assert(actual eq expected)
+  }
+
+  test("setAuthenticationConfig default parser must set authentication all the time") {
     val provider = new MSSQLConnectionProvider()
     val driver = registerDriver(provider.driverClass)
 
@@ -30,7 +43,7 @@ class MSSQLConnectionProviderSuite extends ConnectionProviderSuiteBase {
       options("jdbc:sqlserver://localhost/mssql;jaasConfigurationName=custommssql"))
   }
 
-  test("setAuthenticationConfigIfNeeded custom parser must set authentication if not set") {
+  test("setAuthenticationConfig custom parser must set authentication all the time") {
     val provider = new MSSQLConnectionProvider() {
       override val parserMethod: String = "IntentionallyNotExistingMethod"
     }
@@ -48,4 +61,17 @@ class MSSQLConnectionProviderSuite extends ConnectionProviderSuiteBase {
     testSecureConnectionProvider(provider, driver, defaultOptions)
     testSecureConnectionProvider(provider, driver, customOptions)
   }
+}
+
+private class ThrowingParserDriver(failure: SQLException) extends Driver {
+  def parseAndMergeProperties(url: String, properties: Properties): Properties = throw failure
+
+  override def connect(url: String, info: Properties): Connection = null
+  override def acceptsURL(url: String): Boolean = true
+  override def getPropertyInfo(url: String, info: Properties): Array[DriverPropertyInfo] =
+    Array.empty
+  override def getMajorVersion: Int = 0
+  override def getMinorVersion: Int = 0
+  override def jdbcCompliant(): Boolean = false
+  override def getParentLogger: Logger = null
 }

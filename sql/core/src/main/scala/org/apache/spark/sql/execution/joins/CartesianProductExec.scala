@@ -35,13 +35,19 @@ import org.apache.spark.util.CompletionIterator
 class UnsafeCartesianRDD(
     left : RDD[UnsafeRow],
     right : RDD[UnsafeRow],
-    numFieldsOfRight: Int,
     inMemoryBufferThreshold: Int,
-    spillThreshold: Int)
+    spillThreshold: Int,
+    sizeInBytesSpillThreshold: Long)
   extends CartesianRDD[UnsafeRow, UnsafeRow](left.sparkContext, left, right) {
 
   override def compute(split: Partition, context: TaskContext): Iterator[(UnsafeRow, UnsafeRow)] = {
-    val rowArray = new ExternalAppendOnlyUnsafeRowArray(inMemoryBufferThreshold, spillThreshold)
+    val rowArray = new ExternalAppendOnlyUnsafeRowArray(
+      inMemoryBufferThreshold,
+      // TODO: shall we have a new config to specify the max in-memory buffer size
+      //       of ExternalAppendOnlyUnsafeRowArray?
+      sizeInBytesSpillThreshold,
+      spillThreshold,
+      sizeInBytesSpillThreshold)
 
     val partition = split.asInstanceOf[CartesianPartition]
     rdd2.iterator(partition.s2, context).foreach(rowArray.add)
@@ -81,9 +87,9 @@ case class CartesianProductExec(
     val pair = new UnsafeCartesianRDD(
       leftResults,
       rightResults,
-      right.output.size,
-      sqlContext.conf.cartesianProductExecBufferInMemoryThreshold,
-      sqlContext.conf.cartesianProductExecBufferSpillThreshold)
+      conf.cartesianProductExecBufferInMemoryThreshold,
+      conf.cartesianProductExecBufferSpillThreshold,
+      conf.cartesianProductExecBufferSizeSpillThreshold)
     pair.mapPartitionsWithIndexInternal { (index, iter) =>
       val joiner = GenerateUnsafeRowJoiner.create(left.schema, right.schema)
       val filtered = if (condition.isDefined) {
@@ -103,4 +109,8 @@ case class CartesianProductExec(
       }
     }
   }
+
+  override protected def withNewChildrenInternal(
+      newLeft: SparkPlan, newRight: SparkPlan): CartesianProductExec =
+    copy(left = newLeft, right = newRight)
 }

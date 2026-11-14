@@ -22,21 +22,12 @@ import javax.annotation.Nullable
 
 import scala.collection.Map
 
-import com.fasterxml.jackson.annotation.JsonTypeInfo
-
 import org.apache.spark.TaskEndReason
-import org.apache.spark.annotation.DeveloperApi
+import org.apache.spark.annotation.{DeveloperApi, Since}
 import org.apache.spark.executor.{ExecutorMetrics, TaskMetrics}
 import org.apache.spark.resource.ResourceProfile
 import org.apache.spark.scheduler.cluster.ExecutorInfo
 import org.apache.spark.storage.{BlockManagerId, BlockUpdatedInfo}
-
-@DeveloperApi
-@JsonTypeInfo(use = JsonTypeInfo.Id.CLASS, include = JsonTypeInfo.As.PROPERTY, property = "Event")
-trait SparkListenerEvent {
-  /* Whether output this event to the event log */
-  protected[spark] def logEvent: Boolean = true
-}
 
 @DeveloperApi
 case class SparkListenerStageSubmitted(stageInfo: StageInfo, properties: Properties = null)
@@ -56,7 +47,21 @@ case class SparkListenerTaskGettingResult(taskInfo: TaskInfo) extends SparkListe
 case class SparkListenerSpeculativeTaskSubmitted(
     stageId: Int,
     stageAttemptId: Int = 0)
-  extends SparkListenerEvent
+  extends SparkListenerEvent {
+  // Note: this is here for backwards-compatibility with older versions of this event which
+  // didn't stored taskIndex
+  private var _taskIndex: Int = -1
+  private var _partitionId: Int = -1
+
+  def taskIndex: Int = _taskIndex
+  def partitionId: Int = _partitionId
+
+  def this(stageId: Int, stageAttemptId: Int, taskIndex: Int, partitionId: Int) = {
+    this(stageId, stageAttemptId)
+    _partitionId = partitionId
+    _taskIndex = taskIndex
+  }
+}
 
 @DeveloperApi
 case class SparkListenerTaskEnd(
@@ -90,7 +95,8 @@ case class SparkListenerJobEnd(
   extends SparkListenerEvent
 
 @DeveloperApi
-case class SparkListenerEnvironmentUpdate(environmentDetails: Map[String, Seq[(String, String)]])
+case class SparkListenerEnvironmentUpdate(
+    environmentDetails: Map[String, collection.Seq[(String, String)]])
   extends SparkListenerEvent
 
 @DeveloperApi
@@ -126,6 +132,7 @@ case class SparkListenerExecutorBlacklisted(
   extends SparkListenerEvent
 
 @DeveloperApi
+@Since("3.1.0")
 case class SparkListenerExecutorExcluded(
     time: Long,
     executorId: String,
@@ -144,6 +151,7 @@ case class SparkListenerExecutorBlacklistedForStage(
 
 
 @DeveloperApi
+@Since("3.1.0")
 case class SparkListenerExecutorExcludedForStage(
     time: Long,
     executorId: String,
@@ -164,6 +172,7 @@ case class SparkListenerNodeBlacklistedForStage(
 
 
 @DeveloperApi
+@Since("3.1.0")
 case class SparkListenerNodeExcludedForStage(
     time: Long,
     hostId: String,
@@ -192,6 +201,7 @@ case class SparkListenerNodeBlacklisted(
 
 
 @DeveloperApi
+@Since("3.1.0")
 case class SparkListenerNodeExcluded(
     time: Long,
     hostId: String,
@@ -204,15 +214,18 @@ case class SparkListenerNodeUnblacklisted(time: Long, hostId: String)
   extends SparkListenerEvent
 
 @DeveloperApi
+@Since("3.1.0")
 case class SparkListenerNodeUnexcluded(time: Long, hostId: String)
   extends SparkListenerEvent
 
 @DeveloperApi
+@Since("3.1.0")
 case class SparkListenerUnschedulableTaskSetAdded(
   stageId: Int,
   stageAttemptId: Int) extends SparkListenerEvent
 
 @DeveloperApi
+@Since("3.1.0")
 case class SparkListenerUnschedulableTaskSetRemoved(
   stageId: Int,
   stageAttemptId: Int) extends SparkListenerEvent
@@ -220,11 +233,18 @@ case class SparkListenerUnschedulableTaskSetRemoved(
 @DeveloperApi
 case class SparkListenerBlockUpdated(blockUpdatedInfo: BlockUpdatedInfo) extends SparkListenerEvent
 
+@DeveloperApi
+@Since("3.2.0")
+case class SparkListenerMiscellaneousProcessAdded(time: Long, processId: String,
+    info: MiscellaneousProcessDetails) extends SparkListenerEvent
+
 /**
  * Periodic updates from executors.
  * @param execId executor id
  * @param accumUpdates sequence of (taskId, stageId, stageAttemptId, accumUpdates)
  * @param executorUpdates executor level per-stage metrics updates
+ *
+ * @since 3.1.0
  */
 @DeveloperApi
 case class SparkListenerExecutorMetricsUpdate(
@@ -260,7 +280,9 @@ case class SparkListenerApplicationStart(
     driverAttributes: Option[Map[String, String]] = None) extends SparkListenerEvent
 
 @DeveloperApi
-case class SparkListenerApplicationEnd(time: Long) extends SparkListenerEvent
+case class SparkListenerApplicationEnd(
+    time: Long,
+    exitCode: Option[Int] = None) extends SparkListenerEvent
 
 /**
  * An internal class that describes the metadata of an event log.
@@ -269,6 +291,7 @@ case class SparkListenerApplicationEnd(time: Long) extends SparkListenerEvent
 case class SparkListenerLogStart(sparkVersion: String) extends SparkListenerEvent
 
 @DeveloperApi
+@Since("3.1.0")
 case class SparkListenerResourceProfileAdded(resourceProfile: ResourceProfile)
   extends SparkListenerEvent
 

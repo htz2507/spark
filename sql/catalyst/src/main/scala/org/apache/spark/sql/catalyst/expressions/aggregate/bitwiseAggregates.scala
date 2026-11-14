@@ -18,15 +18,15 @@
 package org.apache.spark.sql.catalyst.expressions.aggregate
 
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, BinaryArithmetic, BitwiseAnd, BitwiseOr, BitwiseXor, ExpectsInputTypes, Expression, ExpressionDescription, If, IsNull, Literal}
+import org.apache.spark.sql.catalyst.trees.UnaryLike
 import org.apache.spark.sql.types.{AbstractDataType, DataType, IntegralType}
 
-abstract class BitAggregate extends DeclarativeAggregate with ExpectsInputTypes {
+abstract class BitAggregate extends DeclarativeAggregate with ExpectsInputTypes
+  with UnaryLike[Expression] {
 
   val child: Expression
 
   def bitOperator(left: Expression, right: Expression): BinaryArithmetic
-
-  override def children: Seq[Expression] = child :: Nil
 
   override def nullable: Boolean = true
 
@@ -55,6 +55,11 @@ abstract class BitAggregate extends DeclarativeAggregate with ExpectsInputTypes 
 
 @ExpressionDescription(
   usage = "_FUNC_(expr) - Returns the bitwise AND of all non-null input values, or null if none.",
+  arguments = """
+    Arguments:
+      * expr - The expression to compute the bitwise AND of.
+        An expression that evaluates to an integral.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(col) FROM VALUES (3), (5) AS tab(col);
@@ -69,10 +74,18 @@ case class BitAndAgg(child: Expression) extends BitAggregate {
   override def bitOperator(left: Expression, right: Expression): BinaryArithmetic = {
     BitwiseAnd(left, right)
   }
+
+  override protected def withNewChildInternal(newChild: Expression): BitAndAgg =
+    copy(child = newChild)
 }
 
 @ExpressionDescription(
   usage = "_FUNC_(expr) - Returns the bitwise OR of all non-null input values, or null if none.",
+  arguments = """
+    Arguments:
+      * expr - The expression to compute the bitwise OR of.
+        An expression that evaluates to an integral.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(col) FROM VALUES (3), (5) AS tab(col);
@@ -87,10 +100,18 @@ case class BitOrAgg(child: Expression) extends BitAggregate {
   override def bitOperator(left: Expression, right: Expression): BinaryArithmetic = {
     BitwiseOr(left, right)
   }
+
+  override protected def withNewChildInternal(newChild: Expression): BitOrAgg =
+    copy(child = newChild)
 }
 
 @ExpressionDescription(
   usage = "_FUNC_(expr) - Returns the bitwise XOR of all non-null input values, or null if none.",
+  arguments = """
+    Arguments:
+      * expr - The expression to compute the bitwise XOR of.
+        An expression that evaluates to an integral.
+  """,
   examples = """
     Examples:
       > SELECT _FUNC_(col) FROM VALUES (3), (5) AS tab(col);
@@ -105,4 +126,7 @@ case class BitXorAgg(child: Expression) extends BitAggregate {
   override def bitOperator(left: Expression, right: Expression): BinaryArithmetic = {
     BitwiseXor(left, right)
   }
+
+  override protected def withNewChildInternal(newChild: Expression): Expression =
+    copy(child = newChild)
 }

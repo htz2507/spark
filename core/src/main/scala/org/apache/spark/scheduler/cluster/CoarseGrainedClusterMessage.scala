@@ -22,8 +22,7 @@ import java.nio.ByteBuffer
 import org.apache.spark.TaskState.TaskState
 import org.apache.spark.resource.{ResourceInformation, ResourceProfile}
 import org.apache.spark.rpc.RpcEndpointRef
-import org.apache.spark.scheduler.ExecutorDecommissionInfo
-import org.apache.spark.scheduler.ExecutorLossReason
+import org.apache.spark.scheduler.{ExecutorLossReason, MiscellaneousProcessDetails}
 import org.apache.spark.util.SerializableBuffer
 
 private[spark] sealed trait CoarseGrainedClusterMessage extends Serializable
@@ -36,7 +35,9 @@ private[spark] object CoarseGrainedClusterMessages {
       sparkProperties: Seq[(String, String)],
       ioEncryptionKey: Option[Array[Byte]],
       hadoopDelegationCreds: Option[Array[Byte]],
-      resourceProfile: ResourceProfile)
+      userCredentials: Option[(Long, Array[Byte])],
+      resourceProfile: ResourceProfile,
+      logLevel: Option[String])
     extends CoarseGrainedClusterMessage
 
   case object RetrieveLastAllocatedExecutorId extends CoarseGrainedClusterMessage
@@ -50,7 +51,17 @@ private[spark] object CoarseGrainedClusterMessages {
   case class KillExecutorsOnHost(host: String)
     extends CoarseGrainedClusterMessage
 
+  case class UpdateExecutorsLogLevel(logLevel: String) extends CoarseGrainedClusterMessage
+
+  case class UpdateExecutorLogLevel(logLevel: String) extends CoarseGrainedClusterMessage
+
+  case class DecommissionExecutorsOnHost(host: String)
+    extends CoarseGrainedClusterMessage
+
   case class UpdateDelegationTokens(tokens: Array[Byte])
+    extends CoarseGrainedClusterMessage
+
+  case class UpdateUserCredentials(version: Long, credentials: Array[Byte])
     extends CoarseGrainedClusterMessage
 
   // Executors to driver
@@ -72,16 +83,25 @@ private[spark] object CoarseGrainedClusterMessages {
       taskId: Long,
       state: TaskState,
       data: SerializableBuffer,
-      resources: Map[String, ResourceInformation] = Map.empty)
+      taskCpus: BigDecimal,
+      resources: Map[String, Map[String, Long]] = Map.empty)
     extends CoarseGrainedClusterMessage
 
   object StatusUpdate {
     /** Alternate factory method that takes a ByteBuffer directly for the data field */
-    def apply(executorId: String, taskId: Long, state: TaskState, data: ByteBuffer,
-        resources: Map[String, ResourceInformation]): StatusUpdate = {
-      StatusUpdate(executorId, taskId, state, new SerializableBuffer(data), resources)
+    def apply(
+        executorId: String,
+        taskId: Long,
+        state: TaskState,
+        data: ByteBuffer,
+        taskCpus: BigDecimal,
+        resources: Map[String, Map[String, Long]]): StatusUpdate = {
+      StatusUpdate(executorId, taskId, state, new SerializableBuffer(data), taskCpus, resources)
     }
   }
+
+  case class ShufflePushCompletion(shuffleId: Int, shuffleMergeId: Int, mapIndex: Int)
+    extends CoarseGrainedClusterMessage
 
   // Internal messages in driver
   case object ReviveOffers extends CoarseGrainedClusterMessage
@@ -103,9 +123,9 @@ private[spark] object CoarseGrainedClusterMessages {
   // It's used for Standalone's cases, where decommission is triggered at MasterWebUI or Worker.
   object DecommissionExecutor extends CoarseGrainedClusterMessage
 
-  // A message that sent to the executor itself when it receives PWR signal,
+  // A message that sent to the executor itself when it receives a signal,
   // indicating the executor starts to decommission.
-  object ExecutorSigPWRReceived extends CoarseGrainedClusterMessage
+  object ExecutorDecommissionSigReceived extends CoarseGrainedClusterMessage
 
   case class RemoveWorker(workerId: String, host: String, message: String)
     extends CoarseGrainedClusterMessage
@@ -121,6 +141,11 @@ private[spark] object CoarseGrainedClusterMessages {
   // In Yarn mode, these are exchanged between the driver and the AM
 
   case class RegisterClusterManager(am: RpcEndpointRef) extends CoarseGrainedClusterMessage
+
+  // Send Miscellaneous Process information to the driver
+  case class MiscellaneousProcessAdded(
+      time: Long, processId: String, info: MiscellaneousProcessDetails)
+    extends CoarseGrainedClusterMessage
 
   // Used by YARN's client mode AM to retrieve the current set of delegation tokens.
   object RetrieveDelegationTokens extends CoarseGrainedClusterMessage
@@ -141,8 +166,10 @@ private[spark] object CoarseGrainedClusterMessages {
   case class KillExecutors(executorIds: Seq[String]) extends CoarseGrainedClusterMessage
 
   // Used internally by executors to shut themselves down.
-  case object Shutdown extends CoarseGrainedClusterMessage
+  case class Shutdown(exitCode: Int = 0) extends CoarseGrainedClusterMessage
 
   // The message to check if `CoarseGrainedSchedulerBackend` thinks the executor is alive or not.
   case class IsExecutorAlive(executorId: String) extends CoarseGrainedClusterMessage
+
+  case class TaskThreadDump(taskId: Long) extends CoarseGrainedClusterMessage
 }

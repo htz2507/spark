@@ -16,13 +16,23 @@
     under the License.
 
 
-==========
+================
 User Guide
-==========
+================
+
+Welcome to the PySpark user guide!
+Each of the below sections contains code-driven examples to help you get familiar with PySpark.
 
 .. toctree::
-    :maxdepth: 2
+   :maxdepth: 2
 
-    arrow_pandas
-    python_packaging
+   dataframes
+   touroftypes
+   dataprep
+   bugbusting
+   udfandudtf
+   sql
+   loadandbehold
+   ansi_migration_guide
+
 

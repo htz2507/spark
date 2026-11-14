@@ -20,7 +20,6 @@ package org.apache.spark.sql
 import scala.collection.immutable.{HashSet => HSet}
 import scala.collection.immutable.Queue
 import scala.collection.mutable.{LinkedHashMap => LHMap}
-import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark.sql.test.SharedSparkSession
 
@@ -47,7 +46,7 @@ package object packageobject {
   case class PackageClass(value: Int)
 }
 
-class DatasetPrimitiveSuite extends QueryTest with SharedSparkSession {
+class DatasetPrimitiveSuite extends SharedSparkSession {
   import testImplicits._
 
   test("toDS") {
@@ -171,23 +170,23 @@ class DatasetPrimitiveSuite extends QueryTest with SharedSparkSession {
   test("groupBy function, map") {
     val ds = Seq(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11).toDS()
     val grouped = ds.groupByKey(_ % 2)
-    val agged = grouped.mapGroups { (g, iter) =>
+    val aggregated = grouped.mapGroups { (g, iter) =>
       val name = if (g == 0) "even" else "odd"
       (name, iter.size)
     }
 
     checkDatasetUnorderly(
-      agged,
+      aggregated,
       ("even", 5), ("odd", 6))
   }
 
   test("groupBy function, flatMap") {
     val ds = Seq("a", "b", "c", "xyz", "hello").toDS()
     val grouped = ds.groupByKey(_.length)
-    val agged = grouped.flatMapGroups { (g, iter) => Iterator(g.toString, iter.mkString) }
+    val aggregated = grouped.flatMapGroups { (g, iter) => Iterator(g.toString, iter.mkString) }
 
     checkDatasetUnorderly(
-      agged,
+      aggregated,
       "1", "abc", "3", "xyz", "5", "hello")
   }
 
@@ -356,6 +355,9 @@ class DatasetPrimitiveSuite extends QueryTest with SharedSparkSession {
 
     checkDataset(Seq(Seq(Some(1), None), Seq(Some(2))).toDF("c").as[Set[Integer]],
       Seq(Set[Integer](1, null), Set[Integer](2)): _*)
+
+    // A decoded set keeps the element order of the source array, which must not matter.
+    checkDataset(Seq(Seq(3, 1, 2)).toDF("c").as[Set[Int]], Set(1, 2, 3))
   }
 
   test("nested sequences") {

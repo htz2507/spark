@@ -18,8 +18,10 @@
 package org.apache.spark.sql.connector.catalog
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.catalyst.{FunctionIdentifier, TableIdentifier}
+import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.analysis.{EliminateSubqueryAliases, UnresolvedIdentifier, UnresolvedRelation, V2Reference}
+import org.apache.spark.sql.catalyst.plans.logical.TransactionalWrite
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.{SQLConf, StaticSQLConf}
 
 /**
@@ -57,14 +59,9 @@ private[sql] trait LookupCatalog extends Logging {
    * Extract session catalog and identifier from a multi-part identifier.
    */
   object SessionCatalogAndIdentifier {
-    import org.apache.spark.sql.connector.catalog.CatalogV2Implicits.MultipartIdentifierHelper
 
     def unapply(parts: Seq[String]): Option[(CatalogPlugin, Identifier)] = parts match {
       case CatalogAndIdentifier(catalog, ident) if CatalogV2Util.isSessionCatalog(catalog) =>
-        if (ident.namespace.length != 1) {
-          throw new AnalysisException(
-            s"The namespace in session catalog must have exactly one name part: ${parts.quoted}")
-        }
         Some(catalog, ident)
       case _ => None
     }
@@ -125,7 +122,17 @@ private[sql] trait LookupCatalog extends Logging {
         Some((catalogManager.v2SessionCatalog, nameParts.asIdentifier))
       } else {
         try {
-          Some((catalogManager.catalog(nameParts.head), nameParts.tail.asIdentifier))
+          val catalog = catalogManager.catalog(nameParts.head)
+          val ident = nameParts.tail.asIdentifier
+          if (CatalogV2Util.isSessionCatalog(catalog)) {
+            // Reject only when namespace is empty (e.g. spark_catalog.t with no database).
+            // Allow multi-part namespace for metadata tables (e.g. default.table.snapshots).
+            if (ident.namespace().isEmpty) {
+              throw QueryCompilationErrors.requiresSinglePartNamespaceError(
+                ident.namespace().toSeq :+ ident.name())
+            }
+          }
+          Some((catalog, ident))
         } catch {
           case _: CatalogNotFoundException =>
             Some((currentCatalog, nameParts.asIdentifier))
@@ -140,43 +147,40 @@ private[sql] trait LookupCatalog extends Logging {
    * For legacy support only. Please use [[CatalogAndIdentifier]] instead on DSv2 code paths.
    */
   object AsTableIdentifier {
-    def unapply(parts: Seq[String]): Option[TableIdentifier] = parts match {
-      case CatalogAndMultipartIdentifier(None, names)
+    def unapply(parts: Seq[String]): Option[TableIdentifier] = {
+      def namesToTableIdentifier(names: Seq[String]): Option[TableIdentifier] = names match {
+        case Seq(name) => Some(TableIdentifier(name))
+        case Seq(database, name) => Some(TableIdentifier(name, Some(database)))
+        case _ => None
+      }
+      parts match {
+        case CatalogAndMultipartIdentifier(None, names)
           if CatalogV2Util.isSessionCatalog(currentCatalog) =>
-        names match {
-          case Seq(name) =>
-            Some(TableIdentifier(name))
-          case Seq(database, name) =>
-            Some(TableIdentifier(name, Some(database)))
-          case _ =>
-            None
-        }
-      case _ =>
-        None
+          namesToTableIdentifier(names)
+        case CatalogAndMultipartIdentifier(Some(catalog), names)
+          if CatalogV2Util.isSessionCatalog(catalog) &&
+             CatalogV2Util.isSessionCatalog(currentCatalog) =>
+          namesToTableIdentifier(names)
+        case _ => None
+      }
     }
   }
 
-  def parseSessionCatalogFunctionIdentifier(nameParts: Seq[String]): FunctionIdentifier = {
-    if (nameParts.length == 1 && catalogManager.v1SessionCatalog.isTempFunction(nameParts.head)) {
-      return FunctionIdentifier(nameParts.head)
-    }
-
-    nameParts match {
-      case SessionCatalogAndIdentifier(_, ident) =>
-        if (nameParts.length == 1) {
-          // If there is only one name part, it means the current catalog is the session catalog.
-          // Here we don't fill the default database, to keep the error message unchanged for
-          // v1 commands.
-          FunctionIdentifier(nameParts.head, None)
-        } else {
-          ident.namespace match {
-            case Array(db) => FunctionIdentifier(ident.name, Some(db))
-            case _ =>
-              throw new AnalysisException(s"Unsupported function name '$ident'")
+  object TransactionalWrite {
+    def unapply(write: TransactionalWrite): Option[TransactionalCatalogPlugin] = {
+      EliminateSubqueryAliases(write.table) match {
+        case UnresolvedRelation(CatalogAndIdentifier(c: TransactionalCatalogPlugin, _), _, _) =>
+          Some(c)
+        case UnresolvedIdentifier(CatalogAndIdentifier(c: TransactionalCatalogPlugin, _), _) =>
+          Some(c)
+        case ref: V2Reference =>
+          ref.catalog match {
+            case c: TransactionalCatalogPlugin => Some(c)
+            case _ => None
           }
-        }
-
-      case _ => throw new AnalysisException("function is only supported in v1 catalog")
+        case _ =>
+          None
+      }
     }
   }
 }

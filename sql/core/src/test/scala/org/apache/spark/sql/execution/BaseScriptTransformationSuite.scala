@@ -18,30 +18,36 @@
 package org.apache.spark.sql.execution
 
 import java.sql.{Date, Timestamp}
+import java.time.{Duration, Period}
 
+import scala.jdk.CollectionConverters._
+
+import org.apache.logging.log4j.Level
 import org.json4s.DefaultFormats
 import org.json4s.JsonDSL._
 import org.json4s.jackson.JsonMethods._
 import org.scalatest.Assertions._
-import org.scalatest.BeforeAndAfterEach
 import org.scalatest.exceptions.TestFailedException
+import org.scalatest.time.SpanSugar._
 
-import org.apache.spark.{SparkException, TaskContext, TestUtils}
+import org.apache.spark.{SparkException, SparkRuntimeException, SparkThrowable, TaskContext,
+    TestUtils}
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.Column
+import org.apache.spark.sql.{QueryTest, Row}
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression, GenericInternalRow}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, GenericInternalRow}
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.test.SQLTestUtils
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.CalendarInterval
+import org.apache.spark.util.ArrayImplicits._
 
-abstract class BaseScriptTransformationSuite extends SparkPlanTest with SQLTestUtils
-  with BeforeAndAfterEach {
+abstract class BaseScriptTransformationSuite extends QueryTest {
   import testImplicits._
   import ScriptTransformationIOSchema._
+
+  protected def defaultSerDe(): String
 
   protected val uncaughtExceptionHandler = new TestUncaughtExceptionHandler
 
@@ -64,11 +70,41 @@ abstract class BaseScriptTransformationSuite extends SparkPlanTest with SQLTestU
   }
 
   def createScriptTransformationExec(
-      input: Seq[Expression],
       script: String,
       output: Seq[Attribute],
       child: SparkPlan,
       ioschema: ScriptTransformationIOSchema): BaseScriptTransformationExec
+
+  protected def checkTransformWithoutSerdeUnsupportedType(
+      exception: Throwable,
+      sqlType: String): Unit = {
+    val err = Iterator.iterate[Throwable](exception)(_.getCause)
+      .takeWhile(_ != null)
+      .collectFirst {
+        case t: SparkThrowable
+            if t.getCondition == "UNSUPPORTED_FEATURE.TRANSFORM_WITHOUT_SERDE_TYPE" => t
+      }.getOrElse {
+        fail(s"expected TRANSFORM_WITHOUT_SERDE_TYPE, got $exception")
+      }
+    checkError(
+      exception = err,
+      condition = "UNSUPPORTED_FEATURE.TRANSFORM_WITHOUT_SERDE_TYPE",
+      parameters = Map("dataType" -> sqlType))
+  }
+
+  protected def checkExceedLimitLength(exception: Throwable, limit: String): Unit = {
+    val runtimeException = Iterator.iterate[Throwable](exception)(_.getCause)
+      .takeWhile(_ != null)
+      .collectFirst {
+        case s: SparkRuntimeException if s.getCondition == "EXCEED_LIMIT_LENGTH" => s
+      }.getOrElse {
+        fail(s"expected EXCEED_LIMIT_LENGTH, got $exception")
+      }
+    checkError(
+      exception = runtimeException,
+      condition = "EXCEED_LIMIT_LENGTH",
+      parameters = Map("limit" -> limit))
+  }
 
   test("cat without SerDe") {
     assume(TestUtils.testCommandAvailable("/bin/bash"))
@@ -77,14 +113,205 @@ abstract class BaseScriptTransformationSuite extends SparkPlanTest with SQLTestU
     checkAnswer(
       rowsDf,
       (child: SparkPlan) => createScriptTransformationExec(
-        input = Seq(rowsDf.col("a").expr),
         script = "cat",
         output = Seq(AttributeReference("a", StringType)()),
         child = child,
         ioschema = defaultIOSchema
       ),
-      rowsDf.collect())
+      rowsDf.collect().toImmutableArraySeq)
     assert(uncaughtExceptionHandler.exception.isEmpty)
+  }
+
+  test("SPARK-60090: TRANSFORM CHAR/VARCHAR assignment via Project") {
+    assume(TestUtils.testCommandAvailable("/bin/bash"))
+    withSQLConf(SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "true") {
+      val query = sql(
+        """
+          |SELECT TRANSFORM(c, v)
+          |USING 'cat' AS (c CHAR(4) COLLATE UTF8_LCASE, v VARCHAR(5) COLLATE UNICODE_CI)
+          |FROM VALUES ('ab', 'xyz') t(c, v)
+          |""".stripMargin)
+      assert(query.schema.map(_.dataType) === Seq(
+        CharType(4, "UTF8_LCASE"),
+        VarcharType(5, "UNICODE_CI")))
+      checkAnswer(query, Row("ab  ", "xyz"))
+    }
+    assert(uncaughtExceptionHandler.exception.isEmpty)
+  }
+
+  test("SPARK-60090: TRANSFORM mixed CHAR and non-CHAR columns") {
+    assume(TestUtils.testCommandAvailable("/bin/bash"))
+    withSQLConf(SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "true") {
+      val query = sql(
+        """
+          |SELECT TRANSFORM(id, name, note)
+          |USING 'cat' AS (id INT, name CHAR(4), note STRING)
+          |FROM VALUES (1, 'ab', 'hello') t(id, name, note)
+          |""".stripMargin)
+      assert(query.schema.map(_.dataType) === Seq(IntegerType, CharType(4), StringType))
+      checkAnswer(query, Row(1, "ab  ", "hello"))
+    }
+    assert(uncaughtExceptionHandler.exception.isEmpty)
+  }
+
+  test("SPARK-60090: TRANSFORM CHAR comparison with a STRING literal") {
+    assume(TestUtils.testCommandAvailable("/bin/bash"))
+    val subquery =
+      """
+        |SELECT * FROM (
+        |  SELECT TRANSFORM(c) USING 'cat' AS (c CHAR(4))
+        |  FROM VALUES ('ab') t(c)
+        |)
+        |""".stripMargin
+    // Either first-class-types flag yields a CharType attribute, so `=` promotes
+    // CHAR to STRING instead of padding the literal (table preserve-only padding
+    // applies only to StringType attributes that carry CHAR metadata).
+    Seq(
+      Map(SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "true"),
+      Map(
+        SQLConf.PRESERVE_CHAR_VARCHAR_TYPE_INFO.key -> "true",
+        SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "false")).foreach { confs =>
+      withSQLConf(confs.toSeq: _*) {
+        checkAnswer(sql(subquery + " WHERE c = 'ab'"), Seq.empty)
+        checkAnswer(sql(subquery), Row("ab  "))
+      }
+    }
+    assert(uncaughtExceptionHandler.exception.isEmpty)
+  }
+
+  test("SPARK-60090: TRANSFORM CHAR/VARCHAR null token") {
+    assume(TestUtils.testCommandAvailable("/bin/bash"))
+    withSQLConf(SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "true") {
+      checkAnswer(
+        sql(
+          """
+            |SELECT TRANSFORM(c)
+            |USING 'cat' AS (c CHAR(4))
+            |FROM VALUES (CAST(NULL AS STRING)), ('ab') t(c)
+            |""".stripMargin),
+        Seq(Row(null), Row("ab  ")))
+      checkAnswer(
+        sql(
+          """
+            |SELECT TRANSFORM(v)
+            |USING 'cat' AS (v VARCHAR(5))
+            |FROM VALUES (CAST(NULL AS STRING)), ('xy') t(v)
+            |""".stripMargin),
+        Seq(Row(null), Row("xy")))
+    }
+    assert(uncaughtExceptionHandler.exception.isEmpty)
+  }
+
+  test("SPARK-60090: TRANSFORM CHAR overflow raises EXCEED_LIMIT_LENGTH") {
+    assume(TestUtils.testCommandAvailable("/bin/bash"))
+    withSQLConf(SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "true") {
+      val exception = intercept[Exception] {
+        sql(
+          """
+            |SELECT TRANSFORM(c)
+            |USING 'cat' AS (c CHAR(4))
+            |FROM VALUES ('abcdef') t(c)
+            |""".stripMargin).collect()
+      }
+      checkExceedLimitLength(exception, "4")
+    }
+  }
+
+  test("SPARK-60090: TRANSFORM VARCHAR overflow raises EXCEED_LIMIT_LENGTH") {
+    assume(TestUtils.testCommandAvailable("/bin/bash"))
+    withSQLConf(SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "true") {
+      val exception = intercept[Exception] {
+        sql(
+          """
+            |SELECT TRANSFORM(v)
+            |USING 'cat' AS (v VARCHAR(5))
+            |FROM VALUES ('abcdefgh') t(v)
+            |""".stripMargin).collect()
+      }
+      checkExceedLimitLength(exception, "5")
+    }
+  }
+
+  test("SPARK-60090: TRANSFORM CHAR/VARCHAR flag off stays STRING") {
+    assume(TestUtils.testCommandAvailable("/bin/bash"))
+    withSQLConf(SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "false") {
+      val query = sql(
+        """
+          |SELECT TRANSFORM(c)
+          |USING 'cat' AS (c CHAR(4))
+          |FROM VALUES ('ab'), ('abcdef') t(c)
+          |""".stripMargin)
+      assert(query.schema.map(_.dataType) === Seq(StringType))
+      checkAnswer(query, Seq(Row("ab"), Row("abcdef")))
+    }
+    assert(uncaughtExceptionHandler.exception.isEmpty)
+  }
+
+  test("SPARK-60090: preserve-only TRANSFORM CHAR/VARCHAR still assigns") {
+    assume(TestUtils.testCommandAvailable("/bin/bash"))
+    withSQLConf(
+        SQLConf.PRESERVE_CHAR_VARCHAR_TYPE_INFO.key -> "true",
+        SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "false") {
+      val query = sql(
+        """
+          |SELECT TRANSFORM(c)
+          |USING 'cat' AS (c CHAR(4))
+          |FROM VALUES ('ab') t(c)
+          |""".stripMargin)
+      // First-class types keep CHAR in the result; assignment still pads / length-checks.
+      assert(query.schema.map(_.dataType) === Seq(CharType(4)))
+      checkAnswer(query, Seq(Row("ab  ")))
+      checkExceedLimitLength(
+        intercept[Exception] {
+          sql(
+            """
+              |SELECT TRANSFORM(c)
+              |USING 'cat' AS (c CHAR(4))
+              |FROM VALUES ('abcdef') t(c)
+              |""".stripMargin).collect()
+        },
+        "4")
+    }
+    assert(uncaughtExceptionHandler.exception.isEmpty)
+  }
+
+  test("SPARK-60090: unreferenced CHAR overflow is pruned like scans") {
+    assume(TestUtils.testCommandAvailable("/bin/bash"))
+    withSQLConf(SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key -> "true") {
+      // Assignment lives in a Project, so count(*) can skip the overflowing column.
+      checkAnswer(
+        sql(
+          """
+            |SELECT count(*) FROM (
+            |  SELECT TRANSFORM(c) USING 'cat' AS (c CHAR(4))
+            |  FROM VALUES ('abcdef') t(c)
+            |)
+            |""".stripMargin),
+        Row(1))
+    }
+  }
+
+  test("SPARK-60090: hand-built CHAR/VARCHAR script output stays unsupported without SerDe") {
+    assume(TestUtils.testCommandAvailable("/bin/bash"))
+    // SQL AS (c CHAR(...)) is rewritten to STRING before the exec. A hand-built plan
+    // that still puts CharType/VarcharType on script output must fail.
+    val input = Seq("ab").toDF("c")
+    Seq(
+      AttributeReference("c", CharType(4))() -> "\"CHAR(4)\"",
+      AttributeReference("v", VarcharType(5))() -> "\"VARCHAR(5)\"",
+      AttributeReference("a", ArrayType(CharType(4)))() -> "\"ARRAY<CHAR(4)>\"").foreach {
+        case (attr, sqlType) =>
+          val exception = intercept[Exception] {
+            QueryTest.executePlan(
+              createScriptTransformationExec(
+                script = "cat",
+                output = Seq(attr),
+                child = input.queryExecution.sparkPlan,
+                ioschema = defaultIOSchema),
+              spark.sqlContext)
+          }
+          checkTransformWithoutSerdeUnsupportedType(exception, sqlType)
+      }
   }
 
   test("script transformation should not swallow errors from upstream operators (no serde)") {
@@ -95,13 +322,12 @@ abstract class BaseScriptTransformationSuite extends SparkPlanTest with SQLTestU
       checkAnswer(
         rowsDf,
         (child: SparkPlan) => createScriptTransformationExec(
-          input = Seq(rowsDf.col("a").expr),
           script = "cat",
           output = Seq(AttributeReference("a", StringType)()),
           child = ExceptionInjectingOperator(child),
           ioschema = defaultIOSchema
         ),
-        rowsDf.collect())
+        rowsDf.collect().toImmutableArraySeq)
     }
     assert(e.getMessage().contains("intentional exception"))
     // Before SPARK-25158, uncaughtExceptionHandler will catch IllegalArgumentException
@@ -109,8 +335,8 @@ abstract class BaseScriptTransformationSuite extends SparkPlanTest with SQLTestU
   }
 
   test("SPARK-25990: TRANSFORM should handle different data types correctly") {
-    assume(TestUtils.testCommandAvailable("python"))
-    val scriptFilePath = copyAndGetResourceFile("test_script.py", ".py").getAbsoluteFile
+    assume(TestUtils.testCommandAvailable("python3"))
+    val scriptFilePath = copyAndGetResourceFile("script.py", ".py").getAbsoluteFile
 
     withTempView("v") {
       val df = Seq(
@@ -124,16 +350,20 @@ abstract class BaseScriptTransformationSuite extends SparkPlanTest with SQLTestU
         s"""
            |SELECT
            |TRANSFORM(a, b, c, d, e)
-           |USING 'python $scriptFilePath' AS (a, b, c, d, e)
+           |  ROW FORMAT DELIMITED
+           |  FIELDS TERMINATED BY '\t'
+           |  USING 'python3 $scriptFilePath' AS (a, b, c, d, e)
+           |  ROW FORMAT DELIMITED
+           |  FIELDS TERMINATED BY '\t'
            |FROM v
         """.stripMargin)
 
       checkAnswer(query, identity, df.select(
-        'a.cast("string"),
-        'b.cast("string"),
-        'c.cast("string"),
-        'd.cast("string"),
-        'e.cast("string")).collect())
+        $"a".cast("string"),
+        $"b".cast("string"),
+        $"c".cast("string"),
+        $"d".cast("string"),
+        $"e".cast("string")).collect().toImmutableArraySeq)
     }
   }
 
@@ -148,12 +378,6 @@ abstract class BaseScriptTransformationSuite extends SparkPlanTest with SQLTestU
       checkAnswer(
         df,
         (child: SparkPlan) => createScriptTransformationExec(
-          input = Seq(
-            df.col("a").expr,
-            df.col("b").expr,
-            df.col("c").expr,
-            df.col("d").expr,
-            df.col("e").expr),
           script = "cat",
           output = Seq(
             AttributeReference("key", StringType)(),
@@ -162,15 +386,12 @@ abstract class BaseScriptTransformationSuite extends SparkPlanTest with SQLTestU
           ioschema = defaultIOSchema.copy(schemaLess = true)
         ),
         df.select(
-          'a.cast("string").as("key"),
-          'b.cast("string").as("value")).collect())
+          $"a".cast("string").as("key"),
+          $"b".cast("string").as("value")).collect().toImmutableArraySeq)
 
       checkAnswer(
-        df,
+        df.select($"a", $"b"),
         (child: SparkPlan) => createScriptTransformationExec(
-          input = Seq(
-            df.col("a").expr,
-            df.col("b").expr),
           script = "cat",
           output = Seq(
             AttributeReference("key", StringType)(),
@@ -179,14 +400,12 @@ abstract class BaseScriptTransformationSuite extends SparkPlanTest with SQLTestU
           ioschema = defaultIOSchema.copy(schemaLess = true)
         ),
         df.select(
-          'a.cast("string").as("key"),
-          'b.cast("string").as("value")).collect())
+          $"a".cast("string").as("key"),
+          $"b".cast("string").as("value")).collect().toImmutableArraySeq)
 
       checkAnswer(
-        df,
+        df.select($"a"),
         (child: SparkPlan) => createScriptTransformationExec(
-          input = Seq(
-            df.col("a").expr),
           script = "cat",
           output = Seq(
             AttributeReference("key", StringType)(),
@@ -195,8 +414,8 @@ abstract class BaseScriptTransformationSuite extends SparkPlanTest with SQLTestU
           ioschema = defaultIOSchema.copy(schemaLess = true)
         ),
         df.select(
-          'a.cast("string").as("key"),
-          lit(null)).collect())
+          $"a".cast("string").as("key"),
+          lit(null)).collect().toImmutableArraySeq)
     }
   }
 
@@ -207,20 +426,54 @@ abstract class BaseScriptTransformationSuite extends SparkPlanTest with SQLTestU
     val e = intercept[SparkException] {
       val plan =
         createScriptTransformationExec(
-          input = Seq(rowsDf.col("a").expr),
           script = "some_non_existent_command",
           output = Seq(AttributeReference("a", StringType)()),
           child = rowsDf.queryExecution.sparkPlan,
           ioschema = defaultIOSchema)
-      SparkPlanTest.executePlan(plan, spark.sqlContext)
+      QueryTest.executePlan(plan, spark.sqlContext)
     }
     assert(e.getMessage.contains("Subprocess exited with status"))
     assert(uncaughtExceptionHandler.exception.isEmpty)
   }
 
+  test("TRANSFORM destroys the script when its task completes before reading all its output") {
+    assume(TestUtils.testCommandAvailable("/bin/bash"))
+
+    def writerThreads(): Set[Thread] = Thread.getAllStackTraces.keySet.asScala
+      .filter(thread => thread.getName.endsWith("WriterThread-Feed") && thread.isAlive).toSet
+    val before = writerThreads()
+    // The script echoes much more input than the pipes hold, while the task reads one row of its
+    // output: the script then blocks on writing its output, and the writer thread on writing the
+    // input, until the script is destroyed.
+    val plan = createScriptTransformationExec(
+      script = "cat",
+      output = Seq(AttributeReference("id", StringType)()),
+      child = spark.range(0, 1000000, 1, 1).queryExecution.sparkPlan,
+      ioschema = defaultIOSchema)
+    val logAppender = new LogAppender("the writer thread of a destroyed script")
+    logAppender.setThreshold(Level.ERROR)
+    withLogAppender(logAppender) {
+      assert(plan.execute().mapPartitions(rows => Iterator(rows.take(1).size)).collect() ===
+        Array(1))
+      eventually(timeout(60.seconds)) {
+        assert((writerThreads() -- before).isEmpty)
+      }
+    }
+    // The interrupt of the writer thread does not escape it, and its failure to write to the
+    // destroyed script is not logged as an error. The writer threads of earlier tests, which have
+    // the same name, may still log, so only those of this test are checked.
+    assert(uncaughtExceptionHandler.exception.isEmpty)
+    val earlierThreads = before.map(_.threadId())
+    val errors = logAppender.loggingEvents.filter { event =>
+      event.getThreadName.endsWith("WriterThread-Feed") &&
+        !earlierThreads.contains(event.getThreadId)
+    }
+    assert(errors.isEmpty, errors.map(_.getMessage.getFormattedMessage).mkString("\n"))
+  }
+
   def testBasicInputDataTypesWith(serde: ScriptTransformationIOSchema, testName: String): Unit = {
     test(s"SPARK-32400: TRANSFORM should support basic data types as input ($testName)") {
-      assume(TestUtils.testCommandAvailable("python"))
+      assume(TestUtils.testCommandAvailable("python3"))
       withTempView("v") {
         val df = Seq(
           (1, "1", 1.0f, 1.0, 11.toByte, BigDecimal(1.0), new Timestamp(1),
@@ -235,17 +488,6 @@ abstract class BaseScriptTransformationSuite extends SparkPlanTest with SQLTestU
         checkAnswer(
           df,
           (child: SparkPlan) => createScriptTransformationExec(
-            input = Seq(
-              df.col("a").expr,
-              df.col("b").expr,
-              df.col("c").expr,
-              df.col("d").expr,
-              df.col("e").expr,
-              df.col("f").expr,
-              df.col("g").expr,
-              df.col("h").expr,
-              df.col("i").expr,
-              df.col("j").expr),
             script = "cat",
             output = Seq(
               AttributeReference("a", IntegerType)(),
@@ -261,7 +503,8 @@ abstract class BaseScriptTransformationSuite extends SparkPlanTest with SQLTestU
             child = child,
             ioschema = serde
           ),
-          df.select('a, 'b, 'c, 'd, 'e, 'f, 'g, 'h, 'i, 'j).collect())
+          df.select($"a", $"b", $"c", $"d", $"e",
+            $"f", $"g", $"h", $"i", $"j").collect().toImmutableArraySeq)
       }
     }
   }
@@ -270,7 +513,7 @@ abstract class BaseScriptTransformationSuite extends SparkPlanTest with SQLTestU
 
   test("SPARK-32400: TRANSFORM should support more data types (interval, array, map, struct " +
     "and udt) as input (no serde)") {
-    assume(TestUtils.testCommandAvailable("python"))
+    assume(TestUtils.testCommandAvailable("python3"))
     withTempView("v") {
       val df = Seq(
         (new CalendarInterval(7, 1, 1000), Array(0, 1, 2), Map("a" -> 1), (1, 2),
@@ -289,28 +532,24 @@ abstract class BaseScriptTransformationSuite extends SparkPlanTest with SQLTestU
       checkAnswer(
         df,
         (child: SparkPlan) => createScriptTransformationExec(
-          input = Seq(
-            df.col("a").expr,
-            df.col("b").expr,
-            df.col("c").expr,
-            df.col("d").expr,
-            df.col("e").expr),
           script = "cat",
           output = Seq(
             AttributeReference("a", CalendarIntervalType)(),
-            AttributeReference("b", StringType)(),
-            AttributeReference("c", StringType)(),
-            AttributeReference("d", StringType)(),
+            AttributeReference("b", ArrayType(IntegerType))(),
+            AttributeReference("c", MapType(StringType, IntegerType))(),
+            AttributeReference("d", StructType(
+              Array(StructField("_1", IntegerType),
+                StructField("_2", IntegerType))))(),
             AttributeReference("e", new SimpleTupleUDT)()),
           child = child,
           ioschema = defaultIOSchema
         ),
-        df.select('a, 'b.cast("string"), 'c.cast("string"), 'd.cast("string"), 'e).collect())
+        df.select($"a", $"b", $"c", $"d", $"e").collect().toImmutableArraySeq)
     }
   }
 
   test("SPARK-32400: TRANSFORM should respect DATETIME_JAVA8API_ENABLED (no serde)") {
-    assume(TestUtils.testCommandAvailable("python"))
+    assume(TestUtils.testCommandAvailable("python3"))
     Array(false, true).foreach { java8AapiEnable =>
       withSQLConf(SQLConf.DATETIME_JAVA8API_ENABLED.key -> java8AapiEnable.toString) {
         withTempView("v") {
@@ -327,7 +566,7 @@ abstract class BaseScriptTransformationSuite extends SparkPlanTest with SQLTestU
               |USING 'cat' AS (a timestamp, b date)
               |FROM v
             """.stripMargin)
-          checkAnswer(query, identity, df.select('a, 'b).collect())
+          checkAnswer(query, identity, df.select($"a", $"b").collect().toImmutableArraySeq)
         }
       }
     }
@@ -362,11 +601,11 @@ abstract class BaseScriptTransformationSuite extends SparkPlanTest with SQLTestU
              |  NULL DEFINED AS 'NULL'
              |FROM v
         """.stripMargin), identity, df.select(
-          'a.cast("string"),
-          'b.cast("string"),
-          'c.cast("string"),
-          'd.cast("string"),
-          'e.cast("string")).collect())
+          $"a".cast("string"),
+          $"b".cast("string"),
+          $"c".cast("string"),
+          $"d".cast("string"),
+          $"e".cast("string")).collect().toImmutableArraySeq)
 
       // input/output with different delimit and show result
       checkAnswer(
@@ -385,11 +624,11 @@ abstract class BaseScriptTransformationSuite extends SparkPlanTest with SQLTestU
              |FROM v
         """.stripMargin), identity, df.select(
           concat_ws(",",
-            'a.cast("string"),
-            'b.cast("string"),
-            'c.cast("string"),
-            'd.cast("string"),
-            'e.cast("string"))).collect())
+            $"a".cast("string"),
+            $"b".cast("string"),
+            $"c".cast("string"),
+            $"d".cast("string"),
+            $"e".cast("string"))).collect().toImmutableArraySeq)
     }
   }
 
@@ -402,11 +641,8 @@ abstract class BaseScriptTransformationSuite extends SparkPlanTest with SQLTestU
     ).toDF("a", "b", "c", "d", "e") // Note column d's data type is Decimal(38, 18)
 
     checkAnswer(
-      df,
+      df.select($"a", $"b"),
       (child: SparkPlan) => createScriptTransformationExec(
-        input = Seq(
-          df.col("a").expr,
-          df.col("b").expr),
         script = "cat",
         output = Seq(
           AttributeReference("a", StringType)(),
@@ -417,9 +653,283 @@ abstract class BaseScriptTransformationSuite extends SparkPlanTest with SQLTestU
         ioschema = defaultIOSchema
       ),
       df.select(
-        'a.cast("string").as("a"),
-        'b.cast("string").as("b"),
-        lit(null), lit(null)).collect())
+        $"a".cast("string").as("a"),
+        $"b".cast("string").as("b"),
+        lit(null), lit(null)).collect().toImmutableArraySeq)
+  }
+
+  test("SPARK-32106: TRANSFORM with non-existent command/file") {
+    Seq(
+      s"""
+         |SELECT TRANSFORM(a)
+         |USING 'some_non_existent_command' AS (a)
+         |FROM VALUES (1) t(a)
+       """.stripMargin,
+      s"""
+         |SELECT TRANSFORM(a)
+         |USING 'python3 some_non_existent_file' AS (a)
+         |FROM VALUES (1) t(a)
+       """.stripMargin).foreach { query =>
+      intercept[SparkException] {
+        // Since an error message is shell-dependent, this test just checks
+        // if the expected exception will be thrown.
+        sql(query).collect()
+      }
+    }
+  }
+
+  test("SPARK-33930: Script Transform default FIELD DELIMIT should be \u0001 (no serde)") {
+    withTempView("v") {
+      val df = Seq(
+        (1, 2, 3),
+        (2, 3, 4),
+        (3, 4, 5)
+      ).toDF("a", "b", "c")
+      df.createTempView("v")
+
+      checkAnswer(
+        sql(
+          s"""
+             |SELECT TRANSFORM(a, b, c)
+             |  ROW FORMAT DELIMITED
+             |  USING 'cat' AS (a)
+             |  ROW FORMAT DELIMITED
+             |  FIELDS TERMINATED BY '&'
+             |FROM v
+        """.stripMargin), identity,
+        Row("1\u00012\u00013") ::
+          Row("2\u00013\u00014") ::
+          Row("3\u00014\u00015") :: Nil)
+    }
+  }
+
+  test("SPARK-31936: Script transform support ArrayType/MapType/StructType (no serde)") {
+    assume(TestUtils.testCommandAvailable("python3"))
+    withTempView("v") {
+      val df = Seq(
+        (Array(0, 1, 2), Array(Array(0, 1), Array(2)),
+          Map("a" -> 1), Map("b" -> Array("a", "b"))),
+        (Array(3, 4, 5), Array(Array(3, 4), Array(5)),
+          Map("b" -> 2), Map("c" -> Array("c", "d"))),
+        (Array(6, 7, 8), Array(Array(6, 7), Array(8)),
+          Map("c" -> 3), Map("d" -> Array("e", "f")))
+      ).toDF("a", "b", "c", "d")
+        .select($"a", $"b", $"c", $"d",
+          struct($"a", $"b").as("e"),
+          struct($"a", $"d").as("f"),
+          struct(struct($"a", $"b"), struct($"a", $"d")).as("g")
+        )
+
+      checkAnswer(
+        df,
+        (child: SparkPlan) => createScriptTransformationExec(
+          script = "cat",
+          output = Seq(
+            AttributeReference("a", ArrayType(IntegerType))(),
+            AttributeReference("b", ArrayType(ArrayType(IntegerType)))(),
+            AttributeReference("c", MapType(StringType, IntegerType))(),
+            AttributeReference("d", MapType(StringType, ArrayType(StringType)))(),
+            AttributeReference("e", StructType(
+              Array(StructField("a", ArrayType(IntegerType)),
+                StructField("b", ArrayType(ArrayType(IntegerType))))))(),
+            AttributeReference("f", StructType(
+              Array(StructField("a", ArrayType(IntegerType)),
+                StructField("d", MapType(StringType, ArrayType(StringType))))))(),
+            AttributeReference("g", StructType(
+              Array(StructField("col1", StructType(
+                Array(StructField("a", ArrayType(IntegerType)),
+                  StructField("b", ArrayType(ArrayType(IntegerType)))))),
+                StructField("col2", StructType(
+                  Array(StructField("a", ArrayType(IntegerType)),
+                    StructField("d", MapType(StringType, ArrayType(StringType)))))))))()),
+          child = child,
+          ioschema = defaultIOSchema
+        ),
+        df.select($"a", $"b", $"c", $"d", $"e",
+          $"f", $"g").collect().toImmutableArraySeq)
+    }
+  }
+
+  test("SPARK-33934: Add SparkFile's root dir to env property PATH") {
+    assume(TestUtils.testCommandAvailable("python3"))
+    val scriptFilePath = copyAndGetResourceFile("script.py", ".py").getAbsoluteFile
+    withTempView("v") {
+      val df = Seq(
+        (1, "1", 1.0, BigDecimal(1.0), new Timestamp(1)),
+        (2, "2", 2.0, BigDecimal(2.0), new Timestamp(2)),
+        (3, "3", 3.0, BigDecimal(3.0), new Timestamp(3))
+      ).toDF("a", "b", "c", "d", "e") // Note column d's data type is Decimal(38, 18)
+      df.createTempView("v")
+
+      // test 'python3 /path/to/script.py' with local file
+      checkAnswer(
+        sql(
+          s"""
+             |SELECT
+             |TRANSFORM(a, b, c, d, e)
+             |  ROW FORMAT DELIMITED
+             |  FIELDS TERMINATED BY '\t'
+             |  USING 'python3 $scriptFilePath' AS (a, b, c, d, e)
+             |  ROW FORMAT DELIMITED
+             |  FIELDS TERMINATED BY '\t'
+             |FROM v
+        """.stripMargin), identity, df.select(
+          $"a".cast("string"),
+          $"b".cast("string"),
+          $"c".cast("string"),
+          $"d".cast("string"),
+          $"e".cast("string")).collect().toImmutableArraySeq)
+
+      // test '/path/to/script.py' with script not executable
+      val e1 = intercept[TestFailedException] {
+        checkAnswer(
+          sql(
+            s"""
+               |SELECT
+               |TRANSFORM(a, b, c, d, e)
+               |  ROW FORMAT DELIMITED
+               |  FIELDS TERMINATED BY '\t'
+               |  USING '$scriptFilePath' AS (a, b, c, d, e)
+               |  ROW FORMAT DELIMITED
+               |  FIELDS TERMINATED BY '\t'
+               |FROM v
+        """.stripMargin), identity, df.select(
+            $"a".cast("string"),
+            $"b".cast("string"),
+            $"c".cast("string"),
+            $"d".cast("string"),
+            $"e".cast("string")).collect().toImmutableArraySeq)
+      }.getMessage
+      // Check with status exit code since in GA test, it may lose detail failed root cause.
+      // Different root cause's exitcode is not same.
+      // In this test, root cause is `Permission denied`
+      assert(e1.contains("Subprocess exited with status 126"))
+
+      // test `/path/to/script.py' with script executable
+      scriptFilePath.setExecutable(true)
+      checkAnswer(
+        sql(
+          s"""
+             |SELECT
+             |TRANSFORM(a, b, c, d, e)
+             |  ROW FORMAT DELIMITED
+             |  FIELDS TERMINATED BY '\t'
+             |  USING '$scriptFilePath' AS (a, b, c, d, e)
+             |  ROW FORMAT DELIMITED
+             |  FIELDS TERMINATED BY '\t'
+             |FROM v
+        """.stripMargin), identity, df.select(
+          $"a".cast("string"),
+          $"b".cast("string"),
+          $"c".cast("string"),
+          $"d".cast("string"),
+          $"e".cast("string")).collect().toImmutableArraySeq)
+
+      scriptFilePath.setExecutable(false)
+      sql(s"ADD FILE ${scriptFilePath.getAbsolutePath}")
+
+      // test `script.py` when file added
+      checkAnswer(
+        sql(
+          s"""
+             |SELECT TRANSFORM(a, b, c, d, e)
+             |  ROW FORMAT DELIMITED
+             |  FIELDS TERMINATED BY '\t'
+             |  USING '${scriptFilePath.getName}' AS (a, b, c, d, e)
+             |  ROW FORMAT DELIMITED
+             |  FIELDS TERMINATED BY '\t'
+             |FROM v
+        """.stripMargin), identity, df.select(
+          $"a".cast("string"),
+          $"b".cast("string"),
+          $"c".cast("string"),
+          $"d".cast("string"),
+          $"e".cast("string")).collect().toImmutableArraySeq)
+
+      // test `python3 script.py` when file added
+      checkAnswer(
+        sql(
+          s"""
+             |SELECT TRANSFORM(a, b, c, d, e)
+             |  ROW FORMAT DELIMITED
+             |  FIELDS TERMINATED BY '\t'
+             |  USING 'python3 ${scriptFilePath.getName}' AS (a, b, c, d, e)
+             |  ROW FORMAT DELIMITED
+             |  FIELDS TERMINATED BY '\t'
+             |FROM v
+        """.stripMargin), identity, df.select(
+          $"a".cast("string"),
+          $"b".cast("string"),
+          $"c".cast("string"),
+          $"d".cast("string"),
+          $"e".cast("string")).collect().toImmutableArraySeq)
+    }
+  }
+
+  test("SPARK-35220: DayTimeIntervalType/YearMonthIntervalType show different " +
+    "between hive serde and row format delimited\t") {
+    assume(TestUtils.testCommandAvailable("/bin/bash"))
+    withTempView("v") {
+      val df = Seq(
+        (Duration.ofDays(1), Period.ofMonths(10))
+      ).toDF("a", "b")
+      df.createTempView("v")
+
+      if (defaultSerDe() == "hive-serde") {
+        checkAnswer(sql(
+          """
+            |SELECT TRANSFORM(a, b)
+            |  USING 'cat' AS (a, b)
+            |FROM v
+            |""".stripMargin),
+          identity,
+          Row("1 00:00:00.000000000", "0-10") :: Nil)
+      } else {
+        checkAnswer(sql(
+          """
+            |SELECT TRANSFORM(a, b)
+            |  USING 'cat' AS (a, b)
+            |FROM v
+            |""".stripMargin),
+          identity,
+          Row("INTERVAL '1 00:00:00' DAY TO SECOND", "INTERVAL '0-10' YEAR TO MONTH") :: Nil)
+      }
+    }
+  }
+
+  test("SPARK-36208: TRANSFORM should support ANSI interval (no serde)") {
+    assume(TestUtils.testCommandAvailable("python3"))
+    withTempView("v") {
+      val df = Seq(
+        (Period.of(1, 2, 0), Duration.ofDays(1).plusHours(2).plusMinutes(3).plusSeconds(4))
+      ).toDF("ym", "dt")
+
+      checkAnswer(
+        df,
+        (child: SparkPlan) => createScriptTransformationExec(
+          script = "cat",
+          output = Seq(
+            AttributeReference("ym", YearMonthIntervalType())(),
+            AttributeReference("dt", DayTimeIntervalType())()),
+          child = child,
+          ioschema = defaultIOSchema
+        ),
+        df.select($"ym", $"dt").collect().toImmutableArraySeq)
+    }
+  }
+
+  test("SPARK-36675: TRANSFORM should support timestamp_ntz (no serde)") {
+    val df = spark.sql("SELECT timestamp_ntz'2021-09-06 20:19:13' col")
+    checkAnswer(
+      df,
+      (child: SparkPlan) => createScriptTransformationExec(
+        script = "cat",
+        output = Seq(
+          AttributeReference("col", TimestampNTZType)()),
+        child = child,
+        ioschema = defaultIOSchema
+      ),
+      df.select($"col").collect().toImmutableArraySeq)
   }
 }
 
@@ -435,6 +945,9 @@ case class ExceptionInjectingOperator(child: SparkPlan) extends UnaryExecNode {
   override def output: Seq[Attribute] = child.output
 
   override def outputPartitioning: Partitioning = child.outputPartitioning
+
+  override protected def withNewChildInternal(newChild: SparkPlan): ExceptionInjectingOperator =
+    copy(child = newChild)
 }
 
 @SQLUserDefinedType(udt = classOf[SimpleTupleUDT])

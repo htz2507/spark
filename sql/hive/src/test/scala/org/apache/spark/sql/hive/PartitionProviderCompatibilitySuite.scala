@@ -26,11 +26,10 @@ import org.apache.spark.sql.{AnalysisException, QueryTest, Row}
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.hive.test.TestHiveSingleton
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.test.SQLTestUtils
 import org.apache.spark.util.Utils
 
 class PartitionProviderCompatibilitySuite
-  extends QueryTest with TestHiveSingleton with SQLTestUtils {
+  extends QueryTest with TestHiveSingleton {
   import testImplicits._
 
   private def setupPartitionedDatasourceTable(tableName: String, dir: File): Unit = {
@@ -53,7 +52,8 @@ class PartitionProviderCompatibilitySuite
       s"ALTER TABLE $tableName PARTITION (partCol=1) SET LOCATION '/foo'",
       s"ALTER TABLE $tableName DROP PARTITION (partCol=1)",
       s"DESCRIBE $tableName PARTITION (partCol=1)",
-      s"SHOW PARTITIONS $tableName")
+      s"SHOW PARTITIONS $tableName",
+      s"SHOW TABLE EXTENDED LIKE '$tableName' PARTITION (partCol=1)")
 
     withSQLConf(SQLConf.HIVE_MANAGE_FILESOURCE_PARTITIONS.key -> "true") {
       for (cmd <- unsupportedCommands) {
@@ -124,10 +124,15 @@ class PartitionProviderCompatibilitySuite
         }
         // disabled
         withSQLConf(SQLConf.HIVE_MANAGE_FILESOURCE_PARTITIONS.key -> "false") {
-          val e = intercept[AnalysisException] {
-            spark.sql(s"show partitions test")
+          Seq(
+            "SHOW PARTITIONS test",
+            "SHOW TABLE EXTENDED LIKE 'test' PARTITION (partCol=1)"
+          ).foreach { showPartitions =>
+            val e = intercept[AnalysisException] {
+              spark.sql(showPartitions)
+            }
+            assert(e.getMessage.contains("filesource partition management is disabled"))
           }
-          assert(e.getMessage.contains("filesource partition management is disabled"))
           spark.sql("refresh table test")
           assert(spark.sql("select * from test").count() == 5)
         }

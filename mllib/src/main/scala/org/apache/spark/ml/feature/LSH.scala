@@ -17,10 +17,8 @@
 
 package org.apache.spark.ml.feature
 
-import scala.util.Random
-
 import org.apache.spark.ml.{Estimator, Model}
-import org.apache.spark.ml.linalg.{Vector, VectorUDT}
+import org.apache.spark.ml.linalg.{SQLDataTypes, Vector}
 import org.apache.spark.ml.param.{IntParam, ParamValidators}
 import org.apache.spark.ml.param.shared.{HasInputCol, HasOutputCol}
 import org.apache.spark.ml.util._
@@ -55,14 +53,15 @@ private[ml] trait LSHParams extends HasInputCol with HasOutputCol {
    * @return A derived schema with [[outputCol]] added.
    */
   protected[this] final def validateAndTransformSchema(schema: StructType): StructType = {
-    SchemaUtils.appendColumn(schema, $(outputCol), DataTypes.createArrayType(new VectorUDT))
+    SchemaUtils.appendColumn(schema, $(outputCol),
+      DataTypes.createArrayType(SQLDataTypes.VectorType))
   }
 }
 
 /**
  * Model produced by [[LSH]].
  */
-private[ml] abstract class LSHModel[T <: LSHModel[T]]
+private[spark] abstract class LSHModel[T <: LSHModel[T]]
   extends Model[T] with LSHParams with MLWritable {
   self: T =>
 
@@ -77,6 +76,12 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
    * @return The mapping of LSH function.
    */
   protected[ml] def hashFunction(elems: Vector): Array[Vector]
+
+  /**
+   * Returns the hash function used by [[transform]]. The returned function must not capture this
+   * model.
+   */
+  protected[ml] def createTransformFunc: Vector => Array[Vector]
 
   /**
    * Calculate the distance between two different keys using the distance metric corresponding
@@ -94,11 +99,11 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
    * @param y Another hash vector.
    * @return The distance between hash vectors x and y.
    */
-  protected[ml] def hashDistance(x: Seq[Vector], y: Seq[Vector]): Double
+  protected[ml] def hashDistance(x: Array[Vector], y: Array[Vector]): Double
 
   override def transform(dataset: Dataset[_]): DataFrame = {
     transformSchema(dataset.schema, logging = true)
-    val transformUDF = udf(hashFunction(_: Vector))
+    val transformUDF = udf(createTransformFunc)
     dataset.withColumn($(outputCol), transformUDF(dataset($(inputCol))))
   }
 
@@ -116,25 +121,25 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
     require(numNearestNeighbors > 0, "The number of nearest neighbors cannot be less than 1")
     // Get Hash Value of the key
     val keyHash = hashFunction(key)
-    val modelDataset: DataFrame = if (!dataset.columns.contains($(outputCol))) {
+    val modelDataset = if (!dataset.columns.contains($(outputCol))) {
         transform(dataset)
       } else {
         dataset.toDF()
       }
 
     val modelSubset = if (singleProbe) {
-      def sameBucket(x: Seq[Vector], y: Seq[Vector]): Boolean = {
-        x.zip(y).exists(tuple => tuple._1 == tuple._2)
+      def sameBucket(x: Array[Vector], y: Array[Vector]): Boolean = {
+        x.iterator.zip(y.iterator).exists(tuple => tuple._1 == tuple._2)
       }
 
       // In the origin dataset, find the hash value that hash the same bucket with the key
-      val sameBucketWithKeyUDF = udf((x: Seq[Vector]) => sameBucket(x, keyHash))
+      val sameBucketWithKeyUDF = udf((x: Array[Vector]) => sameBucket(x, keyHash))
 
       modelDataset.filter(sameBucketWithKeyUDF(col($(outputCol))))
     } else {
       // In the origin dataset, find the hash value that is closest to the key
       // Limit the use of hashDist since it's controversial
-      val hashDistUDF = udf((x: Seq[Vector]) => hashDistance(x, keyHash))
+      val hashDistUDF = udf((x: Array[Vector]) => hashDistance(x, keyHash))
       val hashDistCol = hashDistUDF(col($(outputCol)))
       val modelDatasetWithDist = modelDataset.withColumn(distCol, hashDistCol)
 
@@ -144,13 +149,13 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
           var s = new QuantileSummaries(
             QuantileSummaries.defaultCompressThreshold, relativeError)
           while (iter.hasNext) {
-            val row = iter.next
+            val row = iter.next()
             if (!row.isNullAt(0)) {
               val v = row.getDouble(0)
               if (!v.isNaN) s = s.insert(v)
             }
           }
-          Iterator.single(s.compress)
+          Iterator.single(s.compress())
         } else Iterator.empty
       }.treeReduce((s1, s2) => s1.merge(s2))
       val count = summary.count
@@ -223,7 +228,7 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
       inputName: String,
       explodeCols: Seq[String]): Dataset[_] = {
     require(explodeCols.size == 2, "explodeCols must be two strings.")
-    val modelDataset: DataFrame = if (!dataset.columns.contains($(outputCol))) {
+    val modelDataset = if (!dataset.columns.contains($(outputCol))) {
       transform(dataset)
     } else {
       dataset.toDF()
@@ -280,7 +285,7 @@ private[ml] abstract class LSHModel[T <: LSHModel[T]]
     val explodedB = if (datasetA != datasetB) {
       processDataset(datasetB, rightColName, explodeCols)
     } else {
-      val recreatedB = recreateCol(datasetB, $(inputCol), s"${$(inputCol)}#${Random.nextString(5)}")
+      val recreatedB = recreateCol(datasetB, $(inputCol), Identifiable.randomUID(inputCol.name))
       processDataset(recreatedB, rightColName, explodeCols)
     }
 
@@ -348,7 +353,7 @@ private[ml] abstract class LSH[T <: LSHModel[T]]
 
   override def fit(dataset: Dataset[_]): T = {
     transformSchema(dataset.schema, logging = true)
-    val inputDim = MetadataUtils.getNumFeatures(dataset, $(inputCol))
+    val inputDim = DatasetUtils.getNumFeatures(dataset, $(inputCol))
     val model = createRawLSHModel(inputDim).setParent(this)
     copyValues(model)
   }

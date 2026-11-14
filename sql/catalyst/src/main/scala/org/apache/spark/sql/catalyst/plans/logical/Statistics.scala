@@ -19,19 +19,13 @@ package org.apache.spark.sql.catalyst.plans.logical
 
 import java.io.{ByteArrayInputStream, ByteArrayOutputStream, DataInputStream, DataOutputStream}
 import java.math.{MathContext, RoundingMode}
+import java.util.Base64
 
-import scala.util.control.NonFatal
+import net.jpountz.lz4.{LZ4BlockInputStream, LZ4BlockOutputStream, LZ4Factory}
 
-import net.jpountz.lz4.{LZ4BlockInputStream, LZ4BlockOutputStream}
-
-import org.apache.spark.internal.Logging
-import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.catalog.CatalogColumnStat
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.expressions.aggregate._
-import org.apache.spark.sql.catalyst.util.{ArrayData, DateTimeUtils}
-import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.catalyst.plans.logical.statsEstimation.EstimationUtils
 import org.apache.spark.sql.types._
 import org.apache.spark.util.Utils
 
@@ -55,11 +49,14 @@ object Statistics {
  *                    defaults to the product of children's `sizeInBytes`.
  * @param rowCount Estimated number of rows.
  * @param attributeStats Statistics for Attributes.
+ * @param isRuntime Whether the statistics is inferred from query stage runtime statistics during
+ *                  adaptive query execution.
  */
 case class Statistics(
     sizeInBytes: BigInt,
     rowCount: Option[BigInt] = None,
-    attributeStats: AttributeMap[ColumnStat] = AttributeMap(Nil)) {
+    attributeStats: AttributeMap[ColumnStat] = AttributeMap(Nil),
+    isRuntime: Boolean = false) {
 
   override def toString: String = "Statistics(" + simpleString + ")"
 
@@ -124,6 +121,18 @@ case class ColumnStat(
       maxLen = maxLen,
       histogram = histogram,
       version = version)
+
+  def updateCountStats(
+      oldNumRows: BigInt,
+      newNumRows: BigInt,
+      updatedColumnStatOpt: Option[ColumnStat] = None): ColumnStat = {
+    val updatedColumnStat = updatedColumnStatOpt.getOrElse(this)
+    val newDistinctCount = EstimationUtils.updateStat(oldNumRows, newNumRows,
+      distinctCount, updatedColumnStat.distinctCount)
+    val newNullCount = EstimationUtils.updateStat(oldNumRows, newNumRows,
+      nullCount, updatedColumnStat.nullCount)
+    updatedColumnStat.copy(distinctCount = newDistinctCount, nullCount = newNullCount)
+  }
 }
 
 /**
@@ -194,14 +203,17 @@ object HistogramSerializer {
     out.flush()
     out.close()
 
-    org.apache.commons.codec.binary.Base64.encodeBase64String(bos.toByteArray)
+    Base64.getEncoder().encodeToString(bos.toByteArray)
   }
 
   /** Deserializes a given string to a histogram. */
   final def deserialize(str: String): Histogram = {
-    val bytes = org.apache.commons.codec.binary.Base64.decodeBase64(str)
+    val bytes = Base64.getDecoder().decode(str)
     val bis = new ByteArrayInputStream(bytes)
-    val ins = new DataInputStream(new LZ4BlockInputStream(bis))
+    val ins = new DataInputStream(
+      LZ4BlockInputStream.newBuilder()
+        .withDecompressor(LZ4Factory.fastestInstance().safeDecompressor())
+        .build(bis))
     val height = ins.readDouble()
     val numBins = ins.readInt()
 

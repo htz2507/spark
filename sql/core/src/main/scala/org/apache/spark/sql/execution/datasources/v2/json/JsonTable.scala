@@ -16,13 +16,13 @@
  */
 package org.apache.spark.sql.execution.datasources.v2.json
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.fs.FileStatus
 
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.json.JSONOptionsInRead
-import org.apache.spark.sql.connector.write.{LogicalWriteInfo, WriteBuilder}
+import org.apache.spark.sql.connector.write.{LogicalWriteInfo, Write, WriteBuilder}
 import org.apache.spark.sql.execution.datasources.FileFormat
 import org.apache.spark.sql.execution.datasources.json.JsonDataSource
 import org.apache.spark.sql.execution.datasources.v2.FileTable
@@ -38,7 +38,7 @@ case class JsonTable(
     fallbackFileFormat: Class[_ <: FileFormat])
   extends FileTable(sparkSession, options, paths, userSpecifiedSchema) {
   override def newScanBuilder(options: CaseInsensitiveStringMap): JsonScanBuilder =
-    new JsonScanBuilder(sparkSession, fileIndex, schema, dataSchema, options)
+    JsonScanBuilder(sparkSession, fileIndex, schema, dataSchema, mergedOptions(options))
 
   override def inferSchema(files: Seq[FileStatus]): Option[StructType] = {
     val parsedOptions = new JSONOptionsInRead(
@@ -46,13 +46,19 @@ case class JsonTable(
       sparkSession.sessionState.conf.sessionLocalTimeZone,
       sparkSession.sessionState.conf.columnNameOfCorruptRecord)
     JsonDataSource(parsedOptions).inferSchema(
-      sparkSession, files, parsedOptions)
+      sparkSession, files, parsedOptions, supportsArchiveScan = false)
   }
 
-  override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder =
-    new JsonWriteBuilder(paths, formatName, supportsDataType, info)
+  override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder = {
+    new WriteBuilder {
+      override def build(): Write =
+        JsonWrite(paths, formatName, supportsDataType, mergedWriteInfo(info))
+    }
+  }
 
   override def supportsDataType(dataType: DataType): Boolean = dataType match {
+    case _: GeometryType | _: GeographyType => false
+
     case _: AtomicType => true
 
     case st: StructType => st.forall { f => supportsDataType(f.dataType) }

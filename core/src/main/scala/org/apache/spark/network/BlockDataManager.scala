@@ -22,10 +22,19 @@ import scala.reflect.ClassTag
 import org.apache.spark.TaskContext
 import org.apache.spark.network.buffer.ManagedBuffer
 import org.apache.spark.network.client.StreamCallbackWithID
-import org.apache.spark.storage.{BlockId, ShuffleBlockId, StorageLevel}
+import org.apache.spark.network.shuffle.checksum.Cause
+import org.apache.spark.storage.{BlockId, StorageLevel}
 
 private[spark]
 trait BlockDataManager {
+
+  /**
+   * Diagnose the possible cause of the shuffle data corruption by verifying the shuffle checksums
+   */
+  def diagnoseShuffleBlockCorruption(
+      blockId: BlockId,
+      checksumByReader: Long,
+      algorithm: String): Cause
 
   /**
    * Get the local directories that used by BlockManager to save the blocks to disk
@@ -54,7 +63,9 @@ trait BlockDataManager {
       blockId: BlockId,
       data: ManagedBuffer,
       level: StorageLevel,
-      classTag: ClassTag[_]): Boolean
+      classTag: ClassTag[_],
+      checksum: Option[Long] = None,
+      verifySealedChecksum: Boolean = false): Boolean
 
   /**
    * Put the given block that will be received as a stream.
@@ -65,7 +76,9 @@ trait BlockDataManager {
   def putBlockDataAsStream(
       blockId: BlockId,
       level: StorageLevel,
-      classTag: ClassTag[_]): StreamCallbackWithID
+      classTag: ClassTag[_],
+      checksum: Option[Long] = None,
+      verifySealedChecksum: Boolean = false): StreamCallbackWithID
 
   /**
    * Release locks acquired by [[putBlockData()]] and [[getLocalBlockData()]].

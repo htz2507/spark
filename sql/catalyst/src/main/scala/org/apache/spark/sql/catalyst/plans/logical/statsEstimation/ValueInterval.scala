@@ -18,6 +18,7 @@
 package org.apache.spark.sql.catalyst.plans.logical.statsEstimation
 
 import org.apache.spark.sql.catalyst.expressions.Literal
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.types._
 
 
@@ -52,7 +53,7 @@ object ValueInterval {
       min: Option[Any],
       max: Option[Any],
       dataType: DataType): ValueInterval = dataType match {
-    case StringType | BinaryType => new DefaultValueInterval()
+    case _: StringType | BinaryType => new DefaultValueInterval()
     case _ if min.isEmpty || max.isEmpty => new NullValueInterval()
     case _ =>
       NumericValueInterval(
@@ -70,7 +71,7 @@ object ValueInterval {
     case (n1: NumericValueInterval, n2: NumericValueInterval) =>
       n1.min.compareTo(n2.max) <= 0 && n1.max.compareTo(n2.min) >= 0
     case _ =>
-      throw new UnsupportedOperationException(s"Not supported pair: $r1, $r2 at isIntersected()")
+      throw QueryExecutionErrors.pairUnsupportedAtFunctionError(r1, r2, "isIntersected")
   }
 
   /**
@@ -89,7 +90,7 @@ object ValueInterval {
         (Some(EstimationUtils.fromDouble(newMin, dt)),
           Some(EstimationUtils.fromDouble(newMax, dt)))
       case _ =>
-        throw new UnsupportedOperationException(s"Not supported pair: $r1, $r2 at intersect()")
+        throw QueryExecutionErrors.pairUnsupportedAtFunctionError(r1, r2, "intersect")
     }
   }
 }

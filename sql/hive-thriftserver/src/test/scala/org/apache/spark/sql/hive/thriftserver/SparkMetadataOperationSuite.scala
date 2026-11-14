@@ -24,18 +24,20 @@ import org.apache.hive.service.cli.HiveSQLException
 
 import org.apache.spark.SPARK_VERSION
 import org.apache.spark.sql.catalyst.analysis.FunctionRegistry
+import org.apache.spark.sql.hive.HiveUtils
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.util.VersionUtils
 
-class SparkMetadataOperationSuite extends HiveThriftJdbcTest {
+class SparkMetadataOperationSuite extends HiveThriftServer2TestBase {
 
   override def mode: ServerMode.Value = ServerMode.binary
 
   test("Spark's own GetSchemasOperation(SparkGetSchemasOperation)") {
     def checkResult(rs: ResultSet, dbNames: Seq[String]): Unit = {
       val expected = dbNames.iterator
-      while(rs.next() || expected.hasNext) {
-        assert(rs.getString("TABLE_SCHEM") === expected.next)
+      while (rs.next() || expected.hasNext) {
+        assert(rs.getString("TABLE_SCHEM") === expected.next())
         assert(rs.getString("TABLE_CATALOG").isEmpty)
       }
       // Make sure there are no more elements
@@ -210,18 +212,24 @@ class SparkMetadataOperationSuite extends HiveThriftJdbcTest {
 
   test("Spark's own GetFunctionsOperation(SparkGetFunctionsOperation)") {
     def checkResult(rs: ResultSet, functionNames: Seq[String]): Unit = {
-      functionNames.foreach { func =>
-        val exprInfo = FunctionRegistry.expressions(func)._1
-        assert(rs.next())
-        assert(rs.getString("FUNCTION_SCHEM") === "default")
-        assert(rs.getString("FUNCTION_NAME") === exprInfo.getName)
-        assert(rs.getString("REMARKS") ===
-          s"Usage: ${exprInfo.getUsage}\nExtended Usage:${exprInfo.getExtended}")
-        assert(rs.getInt("FUNCTION_TYPE") === DatabaseMetaData.functionResultUnknown)
-        assert(rs.getString("SPECIFIC_NAME") === exprInfo.getClassName)
+      val rows = scala.collection.mutable.ArrayBuffer[(String, String, String, Int, String)]()
+      while (rs.next()) {
+        rows += ((rs.getString("FUNCTION_SCHEM"), rs.getString("FUNCTION_NAME"),
+          rs.getString("REMARKS"), rs.getInt("FUNCTION_TYPE"), rs.getString("SPECIFIC_NAME")))
       }
-      // Make sure there are no more elements
-      assert(!rs.next())
+      val sortedRows = rows.sortBy(_._2) // by FUNCTION_NAME
+      val sortedExpected = functionNames.sorted
+      assert(sortedRows.size === sortedExpected.size,
+        s"Expected ${sortedExpected.size} functions but got ${sortedRows.size}")
+      sortedExpected.zip(sortedRows).foreach {
+        case (func, (schem, name, remarks, funcType, specificName)) =>
+          val exprInfo = FunctionRegistry.expressions(func)._1
+          assert(schem === "default")
+          assert(name === exprInfo.getName)
+          assert(remarks === s"Usage: ${exprInfo.getUsage}\nExtended Usage:${exprInfo.getExtended}")
+          assert(funcType === DatabaseMetaData.functionResultUnknown)
+          assert(specificName === exprInfo.getClassName)
+      }
     }
 
     withJdbcStatement() { statement =>
@@ -242,6 +250,17 @@ class SparkMetadataOperationSuite extends HiveThriftJdbcTest {
     withJdbcStatement() { statement =>
       val metaData = statement.getConnection.getMetaData
       val rs = metaData.getCatalogs
+      assert(!rs.next())
+    }
+  }
+
+  test("GetCatalogsOperation with catalog metadata enabled") {
+    withJdbcStatement() { statement =>
+      statement.execute("SET spark.sql.thriftServer.catalogMetadata.enabled=true")
+      val metaData = statement.getConnection.getMetaData
+      val rs = metaData.getCatalogs
+      assert(rs.next())
+      assert(rs.getString("TABLE_CAT") === "spark_catalog")
       assert(!rs.next())
     }
   }
@@ -283,6 +302,8 @@ class SparkMetadataOperationSuite extends HiveThriftJdbcTest {
       .add("c14", "timestamp", nullable = false, "14")
       .add("c15", "struct<X: bigint,Y: double>", nullable = true, "15")
       .add("c16", "binary", nullable = false, "16")
+      .add("c17", "char(255)", nullable = true, "17")
+      .add("c18", "varchar(1024)", nullable = false, "18")
 
     val ddl =
       s"""
@@ -292,6 +313,7 @@ class SparkMetadataOperationSuite extends HiveThriftJdbcTest {
          |using parquet""".stripMargin
 
     withJdbcStatement(tableName) { statement =>
+      statement.execute(s"SET ${SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key}=true")
       statement.execute(ddl)
 
       val databaseMetaData = statement.getConnection.getMetaData
@@ -299,7 +321,8 @@ class SparkMetadataOperationSuite extends HiveThriftJdbcTest {
 
       import java.sql.Types._
       val expectedJavaTypes = Seq(BOOLEAN, TINYINT, SMALLINT, INTEGER, BIGINT, FLOAT, DOUBLE,
-        DECIMAL, DECIMAL, VARCHAR, ARRAY, ARRAY, JAVA_OBJECT, DATE, TIMESTAMP, STRUCT, BINARY)
+        DECIMAL, DECIMAL, VARCHAR, ARRAY, ARRAY, JAVA_OBJECT, DATE, TIMESTAMP, STRUCT, BINARY,
+        CHAR, VARCHAR)
 
       var pos = 0
 
@@ -313,8 +336,20 @@ class SparkMetadataOperationSuite extends HiveThriftJdbcTest {
 
         val colSize = rowSet.getInt("COLUMN_SIZE")
         schema(pos).dataType match {
-          case StringType | BinaryType | _: ArrayType | _: MapType => assert(colSize === 0)
+          case StringType | BinaryType | _: ArrayType | _: MapType =>
+            assert(colSize === 0)
+          case c: CharType => assert(colSize === c.length)
+          case v: VarcharType => assert(colSize === v.length)
           case o => assert(colSize === o.defaultSize)
+        }
+        if (schema(pos).name == "c17") assert(colSize === 255)
+        if (schema(pos).name == "c18") assert(colSize === 1024)
+
+        val octetLength = rowSet.getInt("CHAR_OCTET_LENGTH")
+        schema(pos).dataType match {
+          case c: CharType => assert(octetLength === c.length * 4)
+          case v: VarcharType => assert(octetLength === v.length * 4)
+          case _ => assert(octetLength === 0) // JDBC getInt on SQL NULL
         }
 
         assert(rowSet.getInt("BUFFER_LENGTH") === 0) // not used
@@ -336,13 +371,30 @@ class SparkMetadataOperationSuite extends HiveThriftJdbcTest {
 
         assert(rowSet.getInt("NULLABLE") === 1)
         assert(rowSet.getString("REMARKS") === pos.toString)
-        assert(rowSet.getInt("ORDINAL_POSITION") === pos)
+        assert(rowSet.getInt("ORDINAL_POSITION") === pos + 1)
         assert(rowSet.getString("IS_NULLABLE") === "YES")
         assert(rowSet.getString("IS_AUTO_INCREMENT") === "NO")
         pos += 1
       }
 
-      assert(pos === 17, "all columns should have been verified")
+      assert(pos === 19, "all columns should have been verified")
+    }
+  }
+
+  test("SPARK-58794: result metadata preserves CHAR and VARCHAR") {
+    withJdbcStatement() { statement =>
+      statement.execute(s"SET ${SQLConf.CHAR_VARCHAR_STANDARD_SEMANTICS.key}=true")
+      val resultSet = statement.executeQuery(
+        "SELECT CAST('ab' AS CHAR(4)) AS c, CAST('cd' AS VARCHAR(6)) AS v")
+      assert(resultSet.next())
+
+      val metadata = resultSet.getMetaData
+      assert(metadata.getColumnType(1) === java.sql.Types.CHAR)
+      assert(metadata.getColumnTypeName(1) === "char")
+      assert(metadata.getPrecision(1) === 4)
+      assert(metadata.getColumnType(2) === java.sql.Types.VARCHAR)
+      assert(metadata.getColumnTypeName(2) === "varchar")
+      assert(metadata.getPrecision(2) === 6)
     }
   }
 
@@ -351,6 +403,7 @@ class SparkMetadataOperationSuite extends HiveThriftJdbcTest {
     val ddl = s"CREATE GLOBAL TEMP VIEW $viewName as select interval 1 day as i"
 
     withJdbcStatement(viewName) { statement =>
+      statement.execute(s"SET ${SQLConf.LEGACY_INTERVAL_ENABLED.key}=true")
       statement.execute(ddl)
       val data = statement.getConnection.getMetaData
       val rowSet = data.getColumns("", "global_temp", viewName, null)
@@ -366,8 +419,62 @@ class SparkMetadataOperationSuite extends HiveThriftJdbcTest {
         assert(rowSet.getInt("NUM_PREC_RADIX") === 0)
         assert(rowSet.getInt("NULLABLE") === 0)
         assert(rowSet.getString("REMARKS") === "")
-        assert(rowSet.getInt("ORDINAL_POSITION") === 0)
-        assert(rowSet.getString("IS_NULLABLE") === "YES")
+        assert(rowSet.getInt("ORDINAL_POSITION") === 1)
+        assert(rowSet.getString("IS_NULLABLE") === "NO")
+        assert(rowSet.getString("IS_AUTO_INCREMENT") === "NO")
+      }
+    }
+  }
+
+  test("SPARK-35085: Get columns operation should handle ANSI interval column properly") {
+    val viewName1 = "view_interval1"
+    val yearMonthDDL =
+      s"CREATE GLOBAL TEMP VIEW $viewName1 as select interval '1-1' year to month as i"
+
+    withJdbcStatement(viewName1) { statement =>
+      statement.execute(yearMonthDDL)
+      val data = statement.getConnection.getMetaData
+      val rowSet = data.getColumns("", "global_temp", viewName1, null)
+      while (rowSet.next()) {
+        assert(rowSet.getString("TABLE_CAT") === null)
+        assert(rowSet.getString("TABLE_SCHEM") === "global_temp")
+        assert(rowSet.getString("TABLE_NAME") === viewName1)
+        assert(rowSet.getString("COLUMN_NAME") === "i")
+        assert(rowSet.getInt("DATA_TYPE") === java.sql.Types.OTHER)
+        assert(rowSet.getString("TYPE_NAME").equalsIgnoreCase(YearMonthIntervalType().sql))
+        assert(rowSet.getInt("COLUMN_SIZE") === YearMonthIntervalType().defaultSize)
+        assert(rowSet.getInt("DECIMAL_DIGITS") === 0)
+        assert(rowSet.getInt("NUM_PREC_RADIX") === 0)
+        assert(rowSet.getInt("NULLABLE") === 0)
+        assert(rowSet.getString("REMARKS") === "")
+        assert(rowSet.getInt("ORDINAL_POSITION") === 1)
+        assert(rowSet.getString("IS_NULLABLE") === "NO")
+        assert(rowSet.getString("IS_AUTO_INCREMENT") === "NO")
+      }
+    }
+
+    val viewName2 = "view_interval2"
+    val dayTimeDDL =
+      s"CREATE GLOBAL TEMP VIEW $viewName2 as select interval '1 2:3:4.001' day to second as i"
+
+    withJdbcStatement(viewName2) { statement =>
+      statement.execute(dayTimeDDL)
+      val data = statement.getConnection.getMetaData
+      val rowSet = data.getColumns("", "global_temp", viewName2, null)
+      while (rowSet.next()) {
+        assert(rowSet.getString("TABLE_CAT") === null)
+        assert(rowSet.getString("TABLE_SCHEM") === "global_temp")
+        assert(rowSet.getString("TABLE_NAME") === viewName2)
+        assert(rowSet.getString("COLUMN_NAME") === "i")
+        assert(rowSet.getInt("DATA_TYPE") === java.sql.Types.OTHER)
+        assert(rowSet.getString("TYPE_NAME").equalsIgnoreCase(DayTimeIntervalType().sql))
+        assert(rowSet.getInt("COLUMN_SIZE") === DayTimeIntervalType().defaultSize)
+        assert(rowSet.getInt("DECIMAL_DIGITS") === 0)
+        assert(rowSet.getInt("NUM_PREC_RADIX") === 0)
+        assert(rowSet.getInt("NULLABLE") === 0)
+        assert(rowSet.getString("REMARKS") === "")
+        assert(rowSet.getInt("ORDINAL_POSITION") === 1)
+        assert(rowSet.getString("IS_NULLABLE") === "NO")
         assert(rowSet.getString("IS_AUTO_INCREMENT") === "NO")
       }
     }
@@ -393,7 +500,7 @@ class SparkMetadataOperationSuite extends HiveThriftJdbcTest {
         assert(rowSet.getInt("NUM_PREC_RADIX") === 0)
         assert(rowSet.getInt("NULLABLE") === 1)
         assert(rowSet.getString("REMARKS") === "")
-        assert(rowSet.getInt("ORDINAL_POSITION") === 0)
+        assert(rowSet.getInt("ORDINAL_POSITION") === 1)
         assert(rowSet.getString("IS_NULLABLE") === "YES")
         assert(rowSet.getString("IS_AUTO_INCREMENT") === "NO")
       }
@@ -598,6 +705,244 @@ class SparkMetadataOperationSuite extends HiveThriftJdbcTest {
       assert(metaData.getSQLStateType === DatabaseMetaData.sqlStateSQL)
       assert(metaData.getMaxLogicalLobSize === 0)
       assert(!metaData.supportsRefCursors)
+    }
+  }
+
+  test("SPARK-36179: get column operation support TIMESTAMP_[N|L]TZ") {
+    val t = "t_ltz_ntz"
+    // TODO(SPARK-36180): add hive table here too
+    val ddl = s"CREATE GLOBAL TEMP VIEW $t as SELECT TIMESTAMP_LTZ '2018-11-17 13:33:33.000'" +
+      " as c0, TIMESTAMP_NTZ '2018-11-17 13:33:33.000' as c1"
+    withJdbcStatement(t) { statement =>
+      statement.execute(ddl)
+      val md = statement.getConnection.getMetaData
+      val rowSet = md.getColumns(null, "global_temp", t, "%")
+
+      var idx = 0
+      while (rowSet.next()) {
+        assert(rowSet.getString("COLUMN_NAME") === "c" + idx)
+        assert(rowSet.getInt("DATA_TYPE") === java.sql.Types.TIMESTAMP)
+        assert(rowSet.getString("TYPE_NAME") === "TIMESTAMP" + "_NTZ".repeat(idx))
+        assert(rowSet.getInt("COLUMN_SIZE") === 8)
+        assert(rowSet.getInt("DECIMAL_DIGITS") === 6)
+        assert(rowSet.getInt("NUM_PREC_RADIX") === 0)
+        assert(rowSet.getInt("NULLABLE") === 0)
+        assert(rowSet.getInt("ORDINAL_POSITION") === idx + 1)
+        idx += 1
+      }
+    }
+  }
+
+  test("SPARK-54350: SparkGetColumnsOperation respects useZeroBasedColumnOrdinalPosition config") {
+    Seq(true, false).foreach { zeroBasedOrdinal =>
+      val viewName = "view_column_ordinal_position"
+      val ddl = s"CREATE OR REPLACE GLOBAL TEMPORARY VIEW $viewName AS " +
+        "SELECT 1 AS id, 'foo' AS name"
+
+      withJdbcStatement(viewName) { statement =>
+        statement.execute(
+          s"SET ${HiveUtils.LEGACY_STS_ZERO_BASED_COLUMN_ORDINAL.key}=$zeroBasedOrdinal")
+        statement.execute(ddl)
+        val data = statement.getConnection.getMetaData
+        val rowSet = data.getColumns("", "global_temp", viewName, null)
+        assert(rowSet.next())
+        assert(rowSet.getString("TABLE_SCHEM") === "global_temp")
+        assert(rowSet.getString("TABLE_NAME") === viewName)
+        assert(rowSet.getString("COLUMN_NAME") === "id")
+        assert(rowSet.getInt("ORDINAL_POSITION") === (if (zeroBasedOrdinal) 0 else 1))
+        assert(rowSet.next())
+        assert(rowSet.getString("TABLE_SCHEM") === "global_temp")
+        assert(rowSet.getString("TABLE_NAME") === viewName)
+        assert(rowSet.getString("COLUMN_NAME") === "name")
+        assert(rowSet.getInt("ORDINAL_POSITION") === (if (zeroBasedOrdinal) 1 else 2))
+        assert(!rowSet.next())
+      }
+    }
+  }
+
+  test("SPARK-57518: getCatalogs with DSv2 catalog returns all loaded catalogs sorted") {
+    withJdbcStatement() { statement =>
+      statement.execute("SET spark.sql.thriftServer.catalogMetadata.enabled=true")
+      // Configure and load a DSv2 catalog
+      statement.execute(
+        "SET spark.sql.catalog.testcat=" +
+          "org.apache.spark.sql.connector.catalog.InMemoryTableCatalog")
+      // Trigger catalog loading by accessing it
+      statement.execute("USE testcat")
+      // Switch back to spark_catalog for subsequent operations
+      statement.execute("USE spark_catalog")
+
+      val metaData = statement.getConnection.getMetaData
+      val rs = metaData.getCatalogs
+      // Should return both catalogs sorted alphabetically
+      assert(rs.next())
+      assert(rs.getString("TABLE_CAT") === "spark_catalog")
+      assert(rs.next())
+      assert(rs.getString("TABLE_CAT") === "testcat")
+      assert(!rs.next())
+    }
+  }
+
+  test("SPARK-57518: getSchemas with null catalog returns current catalog schemas only") {
+    withJdbcStatement() { statement =>
+      statement.execute("SET spark.sql.thriftServer.catalogMetadata.enabled=true")
+      // Configure and load a DSv2 catalog
+      statement.execute(
+        "SET spark.sql.catalog.testcat=" +
+          "org.apache.spark.sql.connector.catalog.InMemoryTableCatalog")
+      statement.execute("USE testcat")
+      statement.execute("CREATE NAMESPACE testcat.testns")
+      // Switch to spark_catalog
+      statement.execute("USE spark_catalog")
+
+      val metaData = statement.getConnection.getMetaData
+      // null catalog -> current catalog only (spark_catalog)
+      val rs = metaData.getSchemas(null, "%")
+      val schemas = scala.collection.mutable.ArrayBuffer.empty[String]
+      while (rs.next()) {
+        schemas += rs.getString("TABLE_SCHEM")
+        assert(rs.getString("TABLE_CATALOG") === "spark_catalog")
+      }
+      // Should contain default and global_temp at minimum; should NOT contain testns
+      assert(schemas.contains("default"))
+      assert(schemas.contains("global_temp"))
+      assert(!schemas.contains("testns"))
+    }
+  }
+
+  test("SPARK-57518: getSchemas returns schemas from current catalog when set to DSv2 catalog") {
+    withJdbcStatement() { statement =>
+      statement.execute("SET spark.sql.thriftServer.catalogMetadata.enabled=true")
+      statement.execute(
+        "SET spark.sql.catalog.testcat=" +
+          "org.apache.spark.sql.connector.catalog.InMemoryTableCatalog")
+      statement.execute("USE testcat")
+      statement.execute("CREATE NAMESPACE testcat.ns1")
+      statement.execute("CREATE NAMESPACE testcat.ns2")
+
+      val metaData = statement.getConnection.getMetaData
+      // null catalog, current catalog is testcat
+      val rs = metaData.getSchemas(null, "%")
+      val schemas = scala.collection.mutable.ArrayBuffer.empty[String]
+      while (rs.next()) {
+        schemas += rs.getString("TABLE_SCHEM")
+        assert(rs.getString("TABLE_CATALOG") === "testcat")
+      }
+      assert(schemas.contains("ns1"))
+      assert(schemas.contains("ns2"))
+    }
+  }
+
+  test("SPARK-57518: getTables returns TABLE_CAT with current catalog name") {
+    withJdbcStatement("dsv2_table") { statement =>
+      statement.execute("SET spark.sql.thriftServer.catalogMetadata.enabled=true")
+      statement.execute("CREATE TABLE dsv2_table(id INT, name STRING)")
+
+      val metaData = statement.getConnection.getMetaData
+      val rs = metaData.getTables(null, "default", "dsv2_table", null)
+      assert(rs.next())
+      assert(rs.getString("TABLE_CAT") === "spark_catalog")
+      assert(rs.getString("TABLE_SCHEM") === "default")
+      assert(rs.getString("TABLE_NAME") === "dsv2_table")
+      assert(!rs.next())
+    }
+  }
+
+  test("SPARK-57518: getColumns returns TABLE_CAT with current catalog name") {
+    withJdbcStatement("dsv2_col_table") { statement =>
+      statement.execute("SET spark.sql.thriftServer.catalogMetadata.enabled=true")
+      statement.execute("CREATE TABLE dsv2_col_table(id INT, name STRING)")
+
+      val metaData = statement.getConnection.getMetaData
+      val rs = metaData.getColumns(null, "default", "dsv2_col_table", null)
+      assert(rs.next())
+      assert(rs.getString("TABLE_CAT") === "spark_catalog")
+      assert(rs.getString("TABLE_SCHEM") === "default")
+      assert(rs.getString("TABLE_NAME") === "dsv2_col_table")
+      assert(rs.getString("COLUMN_NAME") === "id")
+      assert(rs.next())
+      assert(rs.getString("TABLE_CAT") === "spark_catalog")
+      assert(rs.getString("COLUMN_NAME") === "name")
+      assert(!rs.next())
+    }
+  }
+
+  test("SPARK-57518: getSchemas with catalog metadata disabled returns empty TABLE_CATALOG") {
+    withJdbcStatement() { statement =>
+      statement.execute("SET spark.sql.thriftServer.catalogMetadata.enabled=false")
+      val metaData = statement.getConnection.getMetaData
+      val rs = metaData.getSchemas(null, "default")
+      assert(rs.next())
+      assert(rs.getString("TABLE_SCHEM") === "default")
+      assert(rs.getString("TABLE_CATALOG").isEmpty)
+    }
+  }
+
+  test("SPARK-57518: getTables/getColumns with catalog metadata disabled return legacy " +
+      "empty/null TABLE_CAT") {
+    withJdbcStatement("legacy_t") { statement =>
+      statement.execute("SET spark.sql.thriftServer.catalogMetadata.enabled=false")
+      statement.execute("CREATE TABLE legacy_t(id INT, name STRING)")
+
+      val metaData = statement.getConnection.getMetaData
+
+      // getTables should return empty string or null for TABLE_CAT
+      val tablesRs = metaData.getTables(null, "default", "legacy_t", null)
+      assert(tablesRs.next())
+      val tableCat = tablesRs.getString("TABLE_CAT")
+      assert(tableCat == null || tableCat.isEmpty,
+        s"Expected empty/null TABLE_CAT but got: $tableCat")
+      assert(tablesRs.getString("TABLE_NAME") === "legacy_t")
+      assert(!tablesRs.next())
+
+      // getColumns should return empty string or null for TABLE_CAT
+      val colsRs = metaData.getColumns(null, "default", "legacy_t", null)
+      assert(colsRs.next())
+      val colCat = colsRs.getString("TABLE_CAT")
+      assert(colCat == null || colCat.isEmpty,
+        s"Expected empty/null TABLE_CAT but got: $colCat")
+      assert(colsRs.getString("COLUMN_NAME") === "id")
+      assert(colsRs.next())
+      assert(colsRs.getString("COLUMN_NAME") === "name")
+      assert(!colsRs.next())
+    }
+  }
+
+  test("SPARK-57518: getTables/getColumns do not label V1 rows with a DSv2 current catalog") {
+    // getTables/getColumns list from the V1 SessionCatalog (spark_catalog). When the current
+    // catalog is a DSv2 catalog, TABLE_CAT must NOT be stamped with that catalog's name -- the
+    // listed rows belong to spark_catalog, not the DSv2 catalog. They stay legacy empty/null
+    // here; DSv2 routing for getTables/getColumns is a follow-up.
+    withJdbcStatement("v1_table") { statement =>
+      statement.execute("SET spark.sql.thriftServer.catalogMetadata.enabled=true")
+      statement.execute("CREATE TABLE v1_table(id INT, name STRING)")
+      statement.execute(
+        "SET spark.sql.catalog.testcat=" +
+          "org.apache.spark.sql.connector.catalog.InMemoryTableCatalog")
+      // Make the DSv2 catalog the current catalog.
+      statement.execute("USE testcat")
+
+      val metaData = statement.getConnection.getMetaData
+
+      // getTables still lists the V1 spark_catalog table; TABLE_CAT must be legacy empty/null,
+      // never "testcat".
+      val tablesRs = metaData.getTables(null, "default", "v1_table", null)
+      assert(tablesRs.next())
+      val tableCat = tablesRs.getString("TABLE_CAT")
+      assert(tableCat == null || tableCat.isEmpty,
+        s"V1-listed table must not be labeled with the DSv2 current catalog, got: $tableCat")
+      assert(tablesRs.getString("TABLE_NAME") === "v1_table")
+
+      // Same for getColumns.
+      val colsRs = metaData.getColumns(null, "default", "v1_table", null)
+      assert(colsRs.next())
+      val colCat = colsRs.getString("TABLE_CAT")
+      assert(colCat == null || colCat.isEmpty,
+        s"V1-listed column must not be labeled with the DSv2 current catalog, got: $colCat")
+      assert(colsRs.getString("COLUMN_NAME") === "id")
+
+      // Switch back so withJdbcStatement's DROP TABLE cleanup targets spark_catalog.
+      statement.execute("USE spark_catalog")
     }
   }
 }

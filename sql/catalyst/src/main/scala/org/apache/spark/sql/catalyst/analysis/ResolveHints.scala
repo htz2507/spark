@@ -21,11 +21,12 @@ import java.util.Locale
 
 import scala.collection.mutable
 
-import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.catalyst.expressions.{Ascending, Expression, IntegerLiteral, SortOrder}
+import org.apache.spark.sql.catalyst.expressions.StringLiteral
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.CurrentOrigin
+import org.apache.spark.sql.catalyst.trees.TreePattern.UNRESOLVED_HINT
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.SQLConf
 
 
@@ -36,6 +37,38 @@ import org.apache.spark.sql.internal.SQLConf
  * rules that have different ordering requirements from join strategies.
  */
 object ResolveHints {
+
+  /**
+   * Checks if the given multi-part identifiers are matched with each other.
+   *
+   * The [[ResolveJoinStrategyHints]] rule is applied before the resolution batch in the analyzer
+   * and we cannot semantically compare them at this stage. Therefore, we follow a simple rule;
+   * they match if an identifier in a hint is a tail of an identifier in a relation. This process
+   * is independent of a session catalog (`currentDb` in [[SessionCatalog]]) and it just compares
+   * them literally.
+   *
+   * For example,
+   *  - in a query `SELECT /*+ BROADCAST(t) */ * FROM db1.t JOIN t`,
+   *    the broadcast hint will match both tables, `db1.t` and `t`,
+   *    even when the current db is `db2`.
+   *  - in a query `SELECT /*+ BROADCAST(default.t) */ * FROM default.t JOIN t`,
+   *    the broadcast hint will match the left-side table only, `default.t`.
+   *
+   * The `resolver` is passed in explicitly so that this logic can be shared by both the
+   * fixed-point analyzer and the single-pass resolver, neither of which has to depend on the
+   * other's rule state.
+   */
+  def matchedIdentifier(
+      identInHint: Seq[String],
+      identInQuery: Seq[String],
+      resolver: Resolver): Boolean = {
+    if (identInHint.length <= identInQuery.length) {
+      identInHint.zip(identInQuery.takeRight(identInHint.length))
+        .forall { case (i1, i2) => resolver(i1, i2) }
+    } else {
+      false
+    }
+  }
 
   /**
    * The list of allowed join strategy hints is defined in [[JoinStrategyHint.strategies]], and a
@@ -51,9 +84,7 @@ object ResolveHints {
    * This rule must happen before common table expressions.
    */
   object ResolveJoinStrategyHints extends Rule[LogicalPlan] {
-    private val STRATEGY_HINT_NAMES = JoinStrategyHint.strategies.flatMap(_.hintAliases)
-
-    private val hintErrorHandler = conf.hintErrorHandler
+    private def hintErrorHandler = conf.hintErrorHandler
 
     def resolver: Resolver = conf.resolver
 
@@ -64,27 +95,8 @@ object ResolveHints {
             _.toUpperCase(Locale.ROOT)).contains(hintName.toUpperCase(Locale.ROOT))))
     }
 
-    // This method checks if given multi-part identifiers are matched with each other.
-    // The [[ResolveJoinStrategyHints]] rule is applied before the resolution batch
-    // in the analyzer and we cannot semantically compare them at this stage.
-    // Therefore, we follow a simple rule; they match if an identifier in a hint
-    // is a tail of an identifier in a relation. This process is independent of a session
-    // catalog (`currentDb` in [[SessionCatalog]]) and it just compares them literally.
-    //
-    // For example,
-    //  * in a query `SELECT /*+ BROADCAST(t) */ * FROM db1.t JOIN t`,
-    //    the broadcast hint will match both tables, `db1.t` and `t`,
-    //    even when the current db is `db2`.
-    //  * in a query `SELECT /*+ BROADCAST(default.t) */ * FROM default.t JOIN t`,
-    //    the broadcast hint will match the left-side table only, `default.t`.
-    private def matchedIdentifier(identInHint: Seq[String], identInQuery: Seq[String]): Boolean = {
-      if (identInHint.length <= identInQuery.length) {
-        identInHint.zip(identInQuery.takeRight(identInHint.length))
-          .forall { case (i1, i2) => resolver(i1, i2) }
-      } else {
-        false
-      }
-    }
+    private def matchedIdentifier(identInHint: Seq[String], identInQuery: Seq[String]): Boolean =
+      ResolveHints.matchedIdentifier(identInHint, identInQuery, resolver)
 
     private def extractIdentifier(r: SubqueryAlias): Seq[String] = {
       r.identifier.qualifier :+ r.identifier.name
@@ -119,7 +131,7 @@ object ResolveHints {
           case r: SubqueryAlias if matchedIdentifierInHint(extractIdentifier(r)) =>
             ResolvedHint(plan, createHintInfo(hintName))
 
-          case _: ResolvedHint | _: View | _: With | _: SubqueryAlias =>
+          case _: ResolvedHint | _: View | _: UnresolvedWith | _: SubqueryAlias =>
             // Don't traverse down these nodes.
             // For an existing strategy hint, there is no chance for a match from this point down.
             // The rest (view, with, subquery) indicates different scopes that we shouldn't traverse
@@ -143,18 +155,19 @@ object ResolveHints {
       }
     }
 
-    def apply(plan: LogicalPlan): LogicalPlan = plan resolveOperatorsUp {
-      case h: UnresolvedHint if STRATEGY_HINT_NAMES.contains(h.name.toUpperCase(Locale.ROOT)) =>
+    def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsUpWithPruning(
+      _.containsPattern(UNRESOLVED_HINT), ruleId) {
+      case h: UnresolvedHint if JoinStrategyHint.isJoinStrategyHintName(h.name) =>
         if (h.parameters.isEmpty) {
           // If there is no table alias specified, apply the hint on the entire subtree.
           ResolvedHint(h.child, createHintInfo(h.name))
         } else {
           // Otherwise, find within the subtree query plans to apply the hint.
           val relationNamesInHint = h.parameters.map {
-            case tableName: String => UnresolvedAttribute.parseAttributeName(tableName)
+            case StringLiteral(tableName) => UnresolvedAttribute.parseAttributeName(tableName)
             case tableId: UnresolvedAttribute => tableId.nameParts
-            case unsupported => throw new AnalysisException("Join strategy hint parameter " +
-              s"should be an identifier or string but was $unsupported (${unsupported.getClass}")
+            case unsupported =>
+              throw QueryCompilationErrors.joinStrategyHintParameterNotSupportedError(unsupported)
           }.toSet
           val relationsInHintWithMatch = new mutable.HashSet[Seq[String]]
           val applied = applyJoinStrategyHint(
@@ -169,94 +182,25 @@ object ResolveHints {
   }
 
   /**
-   * COALESCE Hint accepts names "COALESCE", "REPARTITION", and "REPARTITION_BY_RANGE".
+   * COALESCE Hint accepts names "COALESCE", "REPARTITION", "REPARTITION_BY_RANGE", "REBALANCE"
+   * and "REBALANCE_BY_SIZE".
    */
   object ResolveCoalesceHints extends Rule[LogicalPlan] {
+    import CoalesceHintUtils._
 
-    val COALESCE_HINT_NAMES: Set[String] = Set("COALESCE", "REPARTITION", "REPARTITION_BY_RANGE")
-
-    /**
-     * This function handles hints for "COALESCE" and "REPARTITION".
-     * The "COALESCE" hint only has a partition number as a parameter. The "REPARTITION" hint
-     * has a partition number, columns, or both of them as parameters.
-     */
-    private def createRepartition(
-        shuffle: Boolean, hint: UnresolvedHint): LogicalPlan = {
-      val hintName = hint.name.toUpperCase(Locale.ROOT)
-
-      def createRepartitionByExpression(
-          numPartitions: Option[Int], partitionExprs: Seq[Any]): RepartitionByExpression = {
-        val sortOrders = partitionExprs.filter(_.isInstanceOf[SortOrder])
-        if (sortOrders.nonEmpty) throw new IllegalArgumentException(
-          s"""Invalid partitionExprs specified: $sortOrders
-             |For range partitioning use REPARTITION_BY_RANGE instead.
-           """.stripMargin)
-        val invalidParams = partitionExprs.filter(!_.isInstanceOf[UnresolvedAttribute])
-        if (invalidParams.nonEmpty) {
-          throw new AnalysisException(s"$hintName Hint parameter should include columns, but " +
-            s"${invalidParams.mkString(", ")} found")
-        }
-        RepartitionByExpression(
-          partitionExprs.map(_.asInstanceOf[Expression]), hint.child, numPartitions)
-      }
-
-      hint.parameters match {
-        case Seq(IntegerLiteral(numPartitions)) =>
-          Repartition(numPartitions, shuffle, hint.child)
-        case Seq(numPartitions: Int) =>
-          Repartition(numPartitions, shuffle, hint.child)
-        // The "COALESCE" hint (shuffle = false) must have a partition number only
-        case _ if !shuffle =>
-          throw new AnalysisException(s"$hintName Hint expects a partition number as a parameter")
-
-        case param @ Seq(IntegerLiteral(numPartitions), _*) if shuffle =>
-          createRepartitionByExpression(Some(numPartitions), param.tail)
-        case param @ Seq(numPartitions: Int, _*) if shuffle =>
-          createRepartitionByExpression(Some(numPartitions), param.tail)
-        case param @ Seq(_*) if shuffle =>
-          createRepartitionByExpression(None, param)
-      }
-    }
-
-    /**
-     * This function handles hints for "REPARTITION_BY_RANGE".
-     * The "REPARTITION_BY_RANGE" hint must have column names and a partition number is optional.
-     */
-    private def createRepartitionByRange(hint: UnresolvedHint): RepartitionByExpression = {
-      val hintName = hint.name.toUpperCase(Locale.ROOT)
-
-      def createRepartitionByExpression(
-          numPartitions: Option[Int], partitionExprs: Seq[Any]): RepartitionByExpression = {
-        val invalidParams = partitionExprs.filter(!_.isInstanceOf[UnresolvedAttribute])
-        if (invalidParams.nonEmpty) {
-          throw new AnalysisException(s"$hintName Hint parameter should include columns, but " +
-            s"${invalidParams.mkString(", ")} found")
-        }
-        val sortOrder = partitionExprs.map {
-          case expr: SortOrder => expr
-          case expr: Expression => SortOrder(expr, Ascending)
-        }
-        RepartitionByExpression(sortOrder, hint.child, numPartitions)
-      }
-
-      hint.parameters match {
-        case param @ Seq(IntegerLiteral(numPartitions), _*) =>
-          createRepartitionByExpression(Some(numPartitions), param.tail)
-        case param @ Seq(numPartitions: Int, _*) =>
-          createRepartitionByExpression(Some(numPartitions), param.tail)
-        case param @ Seq(_*) =>
-          createRepartitionByExpression(None, param)
-      }
-    }
-
-    def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperators {
+    def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsWithPruning(
+      _.containsPattern(UNRESOLVED_HINT), ruleId) {
       case hint @ UnresolvedHint(hintName, _, _) => hintName.toUpperCase(Locale.ROOT) match {
           case "REPARTITION" =>
-            createRepartition(shuffle = true, hint)
+            createRepartition(shuffle = true, transformStringToAttribute(hint))
           case "COALESCE" =>
-            createRepartition(shuffle = false, hint)
+            createRepartition(shuffle = false, transformStringToAttribute(hint))
           case "REPARTITION_BY_RANGE" =>
-            createRepartitionByRange(hint)
+            createRepartitionByRange(transformStringToAttribute(hint))
+          case "REBALANCE" if conf.adaptiveExecutionEnabled =>
+            createRebalance(transformStringToAttribute(hint))
+          case "REBALANCE_BY_SIZE" if conf.adaptiveExecutionEnabled =>
+            createRebalanceBySize(transformStringToAttribute(hint, skipFirstParameter = true))
           case _ => hint
         }
     }
@@ -268,9 +212,10 @@ object ResolveHints {
    */
   class RemoveAllHints extends Rule[LogicalPlan] {
 
-    private val hintErrorHandler = conf.hintErrorHandler
+    private def hintErrorHandler = conf.hintErrorHandler
 
-    def apply(plan: LogicalPlan): LogicalPlan = plan resolveOperatorsUp {
+    def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsUpWithPruning(
+      _.containsPattern(UNRESOLVED_HINT)) {
       case h: UnresolvedHint =>
         hintErrorHandler.hintNotRecognized(h.name, h.parameters)
         h.child

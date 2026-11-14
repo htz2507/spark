@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.execution.datasources.jdbc.connection
 
+import java.lang.reflect.InvocationTargetException
 import java.security.PrivilegedExceptionAction
 import java.sql.{Connection, Driver}
 import java.util.Properties
@@ -30,6 +31,14 @@ private[sql] class MSSQLConnectionProvider extends SecureConnectionProvider {
   val parserMethod: String = "parseAndMergeProperties"
 
   override val name: String = "mssql"
+
+  private def withInvocationTargetExceptionUnwrapped[T](invocation: => T): T = {
+    try {
+      invocation
+    } catch {
+      case e: InvocationTargetException if e.getCause != null => throw e.getCause
+    }
+  }
 
   override def appEntry(driver: Driver, options: JDBCOptions): String = {
     val configName = "jaasConfigurationName"
@@ -48,8 +57,9 @@ private[sql] class MSSQLConnectionProvider extends SecureConnectionProvider {
     parseURL match {
       case Some(m) =>
         logDebug("Property parser method found, using it")
-        m.invoke(driver, options.url, null).asInstanceOf[Properties]
-          .getProperty(configName, appEntryDefault)
+        withInvocationTargetExceptionUnwrapped {
+          m.invoke(driver, options.url, null)
+        }.asInstanceOf[Properties].getProperty(configName, appEntryDefault)
 
       case None =>
         logDebug("Property parser method not found, using custom parsing mechanism")
@@ -61,7 +71,7 @@ private[sql] class MSSQLConnectionProvider extends SecureConnectionProvider {
 
   override def getConnection(driver: Driver, options: Map[String, String]): Connection = {
     val jdbcOptions = new JDBCOptions(options)
-    setAuthenticationConfigIfNeeded(driver, jdbcOptions)
+    setAuthenticationConfig(driver, jdbcOptions)
     UserGroupInformation.loginUserFromKeytabAndReturnUGI(jdbcOptions.principal, jdbcOptions.keytab)
       .doAs(
         new PrivilegedExceptionAction[Connection]() {
@@ -78,19 +88,5 @@ private[sql] class MSSQLConnectionProvider extends SecureConnectionProvider {
     result.put("integratedSecurity", "true")
     result.put("authenticationScheme", "JavaKerberos")
     result
-  }
-
-  override def setAuthenticationConfigIfNeeded(driver: Driver, options: JDBCOptions): Unit = {
-    val (parent, configEntry) = getConfigWithAppEntry(driver, options)
-    /**
-     * Couple of things to mention here (v8.2.2 client):
-     * 1. MS SQL supports JAAS application name configuration
-     * 2. MS SQL sets a default JAAS config if "java.security.auth.login.config" is not set
-     */
-    val entryUsesKeytab = configEntry != null &&
-      configEntry.exists(_.getOptions().get("useKeyTab") == "true")
-    if (configEntry == null || configEntry.isEmpty || !entryUsesKeytab) {
-      setAuthenticationConfig(parent, driver, options)
-    }
   }
 }

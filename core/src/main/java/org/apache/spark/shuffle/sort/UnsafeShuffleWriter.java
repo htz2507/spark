@@ -28,23 +28,25 @@ import java.util.Iterator;
 
 import scala.Option;
 import scala.Product2;
-import scala.collection.JavaConverters;
+import scala.jdk.javaapi.CollectionConverters;
 import scala.reflect.ClassTag;
 import scala.reflect.ClassTag$;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.io.ByteStreams;
 import com.google.common.io.Closeables;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import org.apache.spark.*;
 import org.apache.spark.annotation.Private;
 import org.apache.spark.internal.config.package$;
+import org.apache.spark.internal.SparkLogger;
+import org.apache.spark.internal.SparkLoggerFactory;
+import org.apache.spark.internal.LogKeys;
+import org.apache.spark.internal.MDC;
 import org.apache.spark.io.CompressionCodec;
 import org.apache.spark.io.CompressionCodec$;
 import org.apache.spark.io.NioBufferedFileInputStream;
 import org.apache.spark.memory.TaskMemoryManager;
+import org.apache.spark.network.shuffle.checksum.ShuffleChecksumHelper;
 import org.apache.spark.network.util.LimitedInputStream;
 import org.apache.spark.scheduler.MapStatus;
 import org.apache.spark.scheduler.MapStatus$;
@@ -57,15 +59,17 @@ import org.apache.spark.shuffle.api.ShuffleMapOutputWriter;
 import org.apache.spark.shuffle.api.ShufflePartitionWriter;
 import org.apache.spark.shuffle.api.SingleSpillShuffleMapOutputWriter;
 import org.apache.spark.shuffle.api.WritableByteChannelWrapper;
+import org.apache.spark.shuffle.checksum.RowBasedChecksum;
 import org.apache.spark.storage.BlockManager;
 import org.apache.spark.storage.TimeTrackingOutputStream;
 import org.apache.spark.unsafe.Platform;
+import org.apache.spark.util.ExposedBufferByteArrayOutputStream;
 import org.apache.spark.util.Utils;
 
 @Private
 public class UnsafeShuffleWriter<K, V> extends ShuffleWriter<K, V> {
 
-  private static final Logger logger = LoggerFactory.getLogger(UnsafeShuffleWriter.class);
+  private static final SparkLogger logger = SparkLoggerFactory.getLogger(UnsafeShuffleWriter.class);
 
   private static final ClassTag<Object> OBJECT_CLASS_TAG = ClassTag$.MODULE$.Object();
 
@@ -84,20 +88,22 @@ public class UnsafeShuffleWriter<K, V> extends ShuffleWriter<K, V> {
   private final SparkConf sparkConf;
   private final boolean transferToEnabled;
   private final int initialSortBufferSize;
-  private final int inputBufferSizeInBytes;
+  private final int mergeBufferSizeInBytes;
 
   @Nullable private MapStatus mapStatus;
   @Nullable private ShuffleExternalSorter sorter;
+  @Nullable private long[] partitionLengths;
   private long peakMemoryUsedBytes = 0;
 
-  /** Subclass of ByteArrayOutputStream that exposes `buf` directly. */
-  private static final class MyByteArrayOutputStream extends ByteArrayOutputStream {
-    MyByteArrayOutputStream(int size) { super(size); }
-    public byte[] getBuf() { return buf; }
-  }
-
-  private MyByteArrayOutputStream serBuffer;
+  private ExposedBufferByteArrayOutputStream serBuffer;
   private SerializationStream serOutputStream;
+
+  /**
+   * RowBasedChecksum calculator for each partition. RowBasedChecksum is independent
+   * of the input row order, which is used to detect whether different task attempts
+   * of the same partition produce different output data or not.
+   */
+  private final RowBasedChecksum[] rowBasedChecksums;
 
   /**
    * Are we in the process of stopping? Because map tasks can call stop() with success = true
@@ -114,7 +120,7 @@ public class UnsafeShuffleWriter<K, V> extends ShuffleWriter<K, V> {
       TaskContext taskContext,
       SparkConf sparkConf,
       ShuffleWriteMetricsReporter writeMetrics,
-      ShuffleExecutorComponents shuffleExecutorComponents) {
+      ShuffleExecutorComponents shuffleExecutorComponents) throws SparkException {
     final int numPartitions = handle.dependency().partitioner().numPartitions();
     if (numPartitions > SortShuffleManager.MAX_SHUFFLE_OUTPUT_PARTITIONS_FOR_SERIALIZED_MODE()) {
       throw new IllegalArgumentException(
@@ -133,11 +139,12 @@ public class UnsafeShuffleWriter<K, V> extends ShuffleWriter<K, V> {
     this.shuffleExecutorComponents = shuffleExecutorComponents;
     this.taskContext = taskContext;
     this.sparkConf = sparkConf;
-    this.transferToEnabled = sparkConf.getBoolean("spark.file.transferTo", true);
+    this.transferToEnabled = (boolean) sparkConf.get(package$.MODULE$.SHUFFLE_MERGE_PREFER_NIO());
     this.initialSortBufferSize =
       (int) (long) sparkConf.get(package$.MODULE$.SHUFFLE_SORT_INIT_BUFFER_SIZE());
-    this.inputBufferSizeInBytes =
-      (int) (long) sparkConf.get(package$.MODULE$.SHUFFLE_FILE_BUFFER_SIZE()) * 1024;
+    this.mergeBufferSizeInBytes =
+      (int) (long) sparkConf.get(package$.MODULE$.SHUFFLE_FILE_MERGE_BUFFER_SIZE()) * 1024;
+    this.rowBasedChecksums = dep.rowBasedChecksums();
     open();
   }
 
@@ -159,12 +166,23 @@ public class UnsafeShuffleWriter<K, V> extends ShuffleWriter<K, V> {
     return peakMemoryUsedBytes;
   }
 
+  // For test only.
+  @VisibleForTesting
+  RowBasedChecksum[] getRowBasedChecksums() {
+    return rowBasedChecksums;
+  }
+
+  @VisibleForTesting
+  long getAggregatedChecksumValue() {
+    return RowBasedChecksum.getAggregatedChecksumValue(rowBasedChecksums);
+  }
+
   /**
    * This convenience method should only be called in test code.
    */
   @VisibleForTesting
   public void write(Iterator<Product2<K, V>> records) throws IOException {
-    write(JavaConverters.asScalaIteratorConverter(records).asScala());
+    write(CollectionConverters.asScala(records));
   }
 
   @Override
@@ -197,7 +215,7 @@ public class UnsafeShuffleWriter<K, V> extends ShuffleWriter<K, V> {
     }
   }
 
-  private void open() {
+  private void open() throws SparkException {
     assert (sorter == null);
     sorter = new ShuffleExternalSorter(
       memoryManager,
@@ -207,7 +225,7 @@ public class UnsafeShuffleWriter<K, V> extends ShuffleWriter<K, V> {
       partitioner.numPartitions(),
       sparkConf,
       writeMetrics);
-    serBuffer = new MyByteArrayOutputStream(DEFAULT_INITIAL_SER_BUFFER_SIZE);
+    serBuffer = new ExposedBufferByteArrayOutputStream(DEFAULT_INITIAL_SER_BUFFER_SIZE);
     serOutputStream = serializer.serializeStream(serBuffer);
   }
 
@@ -218,19 +236,19 @@ public class UnsafeShuffleWriter<K, V> extends ShuffleWriter<K, V> {
     serBuffer = null;
     serOutputStream = null;
     final SpillInfo[] spills = sorter.closeAndGetSpills();
-    sorter = null;
-    final long[] partitionLengths;
     try {
       partitionLengths = mergeSpills(spills);
     } finally {
+      sorter = null;
       for (SpillInfo spill : spills) {
         if (spill.file.exists() && !spill.file.delete()) {
-          logger.error("Error while deleting spill file {}", spill.file.getPath());
+          logger.error("Error while deleting spill file {}",
+            MDC.of(LogKeys.PATH, spill.file.getPath()));
         }
       }
     }
     mapStatus = MapStatus$.MODULE$.apply(
-      blockManager.shuffleServerId(), partitionLengths, mapId);
+      blockManager.shuffleServerId(), partitionLengths, mapId, getAggregatedChecksumValue());
   }
 
   @VisibleForTesting
@@ -248,6 +266,9 @@ public class UnsafeShuffleWriter<K, V> extends ShuffleWriter<K, V> {
 
     sorter.insertRecord(
       serBuffer.getBuf(), Platform.BYTE_ARRAY_OFFSET, serializedRecordSize, partitionId);
+    if (rowBasedChecksums.length > 0) {
+      rowBasedChecksums[partitionId].update(key, record._2());
+    }
   }
 
   @VisibleForTesting
@@ -267,7 +288,8 @@ public class UnsafeShuffleWriter<K, V> extends ShuffleWriter<K, V> {
     if (spills.length == 0) {
       final ShuffleMapOutputWriter mapWriter = shuffleExecutorComponents
           .createMapOutputWriter(shuffleId, mapId, partitioner.numPartitions());
-      return mapWriter.commitAllPartitions().getPartitionLengths();
+      return mapWriter.commitAllPartitions(
+        ShuffleChecksumHelper.EMPTY_CHECKSUM_VALUE).getPartitionLengths();
     } else if (spills.length == 1) {
       Optional<SingleSpillShuffleMapOutputWriter> maybeSingleFileWriter =
           shuffleExecutorComponents.createSingleFileMapOutputWriter(shuffleId, mapId);
@@ -277,7 +299,8 @@ public class UnsafeShuffleWriter<K, V> extends ShuffleWriter<K, V> {
         partitionLengths = spills[0].partitionLengths;
         logger.debug("Merge shuffle spills for mapId {} with length {}", mapId,
             partitionLengths.length);
-        maybeSingleFileWriter.get().transferMapSpillFile(spills[0].file, partitionLengths);
+        maybeSingleFileWriter.get()
+          .transferMapSpillFile(spills[0].file, partitionLengths, sorter.getChecksums());
       } else {
         partitionLengths = mergeSpillsUsingStandardWriter(spills);
       }
@@ -324,13 +347,7 @@ public class UnsafeShuffleWriter<K, V> extends ShuffleWriter<K, V> {
         logger.debug("Using slow merge");
         mergeSpillsWithFileStream(spills, mapWriter, compressionCodec);
       }
-      // When closing an UnsafeShuffleExternalSorter that has already spilled once but also has
-      // in-memory records, we write out the in-memory records to a file but do not count that
-      // final write as bytes spilled (instead, it's accounted as shuffle write). The merge needs
-      // to be counted as shuffle write, but this will lead to double-counting of the final
-      // SpillInfo's bytes.
-      writeMetrics.decBytesWritten(spills[spills.length - 1].file.length());
-      partitionLengths = mapWriter.commitAllPartitions().getPartitionLengths();
+      partitionLengths = mapWriter.commitAllPartitions(sorter.getChecksums()).getPartitionLengths();
     } catch (Exception e) {
       try {
         mapWriter.abort(e);
@@ -372,7 +389,7 @@ public class UnsafeShuffleWriter<K, V> extends ShuffleWriter<K, V> {
       for (int i = 0; i < spills.length; i++) {
         spillInputStreams[i] = new NioBufferedFileInputStream(
           spills[i].file,
-          inputBufferSizeInBytes);
+          mergeBufferSizeInBytes);
         // Only convert the partitionLengths when debug level is enabled.
         if (logger.isDebugEnabled()) {
           logger.debug("Partition lengths for mapId {} in Spill {}: {}", mapId, i,
@@ -404,7 +421,7 @@ public class UnsafeShuffleWriter<K, V> extends ShuffleWriter<K, V> {
                   partitionInputStream = compressionCodec.compressedInputStream(
                       partitionInputStream);
                 }
-                ByteStreams.copy(partitionInputStream, partitionOutput);
+                partitionInputStream.transferTo(partitionOutput);
                 copySpillThrewException = false;
               } finally {
                 Closeables.close(partitionInputStream, copySpillThrewException);
@@ -542,5 +559,10 @@ public class UnsafeShuffleWriter<K, V> extends ShuffleWriter<K, V> {
     public void close() throws IOException {
       channel.close();
     }
+  }
+
+  @Override
+  public long[] getPartitionLengths() {
+    return partitionLengths;
   }
 }

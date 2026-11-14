@@ -19,13 +19,15 @@ package org.apache.spark.sql.streaming
 
 import java.io.File
 
-import org.apache.commons.io.FileUtils
+import scala.annotation.tailrec
 
-import org.apache.spark.SparkException
+import org.apache.spark.{SparkException, SparkUnsupportedOperationException}
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.streaming.InternalOutputModes.Complete
-import org.apache.spark.sql.execution.streaming.MemoryStream
+import org.apache.spark.sql.execution.streaming.runtime.MemoryStream
+import org.apache.spark.sql.execution.streaming.state.{StateStoreKeyRowFormatValidationFailure, StateStoreValueRowFormatValidationFailure}
 import org.apache.spark.sql.functions._
+import org.apache.spark.tags.SlowSQLTest
 import org.apache.spark.util.Utils
 
 /**
@@ -36,6 +38,7 @@ import org.apache.spark.util.Utils
  * a new test for the issue, just like the test suite "SPARK-28067 changed the sum decimal unsafe
  * row format".
  */
+@SlowSQLTest
 class StreamingStateStoreFormatCompatibilitySuite extends StreamTest {
   import testImplicits._
 
@@ -43,7 +46,7 @@ class StreamingStateStoreFormatCompatibilitySuite extends StreamTest {
     val resourceUri = this.getClass.getResource("/structured-streaming/" +
       s"checkpoint-version-2.4.5-for-compatibility-test-${testName}").toURI
     val checkpointDir = Utils.createTempDir().getCanonicalFile
-    FileUtils.copyDirectory(new File(resourceUri), checkpointDir)
+    Utils.copyDirectory(new File(resourceUri), checkpointDir)
     checkpointDir
   }
 
@@ -239,11 +242,21 @@ class StreamingStateStoreFormatCompatibilitySuite extends StreamTest {
         CheckAnswer(Row(0, 20, Seq(0, 2, 4, 6, 8)), Row(1, 25, Seq(1, 3, 5, 7, 9)))
        */
       AddData(inputData, 10 to 19: _*),
-      ExpectFailure[SparkException](e => {
-        // Check the exception message to make sure the state store format changing.
-        assert(e.getCause.getCause.getMessage.contains(
-          "The streaming query failed by state format invalidation."))
-      })
+      ExpectFailure[SparkException] { e =>
+        assert(findStateSchemaException(e))
+      }
     )
+  }
+
+  @tailrec
+  private def findStateSchemaException(exc: Throwable): Boolean = {
+    exc match {
+      case _: SparkUnsupportedOperationException => true
+      case _: StateStoreKeyRowFormatValidationFailure => true
+      case _: StateStoreValueRowFormatValidationFailure => true
+      case e: SparkException if e.getCondition.contains("ROW_FORMAT_VALIDATION_FAILURE") => true
+      case e1 if e1.getCause != null => findStateSchemaException(e1.getCause)
+      case _ => false
+    }
   }
 }

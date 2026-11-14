@@ -17,14 +17,18 @@
 
 package org.apache.spark.security
 
-import java.io.{BufferedOutputStream, OutputStream}
-import java.net.{InetAddress, ServerSocket, Socket}
+import java.io.{BufferedOutputStream, File, OutputStream}
+import java.net.{InetAddress, InetSocketAddress, StandardProtocolFamily, UnixDomainSocketAddress}
+import java.nio.channels.{Channels, ServerSocketChannel, SocketChannel}
+import java.util.UUID
 
 import scala.concurrent.Promise
 import scala.concurrent.duration.Duration
 import scala.util.Try
 
 import org.apache.spark.SparkEnv
+import org.apache.spark.internal.Logging
+import org.apache.spark.internal.config.Python.PYTHON_AUTH_SOCKET_TIMEOUT
 import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.util.{ThreadUtils, Utils}
 
@@ -34,46 +38,80 @@ import org.apache.spark.util.{ThreadUtils, Utils}
  * handling one batch of data, with authentication and error handling.
  *
  * The socket server can only accept one connection, or close if no connection
- * in 15 seconds.
+ * in configurable amount of seconds (default 15).
  */
 private[spark] abstract class SocketAuthServer[T](
     authHelper: SocketAuthHelper,
-    threadName: String) {
+    threadName: String) extends Logging {
 
   def this(env: SparkEnv, threadName: String) = this(new SocketAuthHelper(env.conf), threadName)
   def this(threadName: String) = this(SparkEnv.get, threadName)
 
   private val promise = Promise[T]()
+  private val isUnixDomainSock: Boolean = authHelper.isUnixDomainSock
 
-  private def startServer(): (Int, String) = {
-    val serverSocket = new ServerSocket(0, 1, InetAddress.getByAddress(Array(127, 0, 0, 1)))
-    // Close the socket if no connection in 15 seconds
-    serverSocket.setSoTimeout(15000)
+  private def startServer(): (Any, String) = {
+    logTrace("Creating listening socket")
+    lazy val sockPath = new File(authHelper.sockDir, s".${UUID.randomUUID()}.sock")
+
+    val (serverSocketChannel, address) = if (isUnixDomainSock) {
+      val address = UnixDomainSocketAddress.of(sockPath.getPath)
+      val serverChannel = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
+      sockPath.deleteOnExit()
+      serverChannel.bind(address)
+      (serverChannel, address)
+    } else {
+      val address = InetAddress.getLoopbackAddress()
+      val serverChannel = ServerSocketChannel.open()
+      serverChannel.bind(new InetSocketAddress(address, 0), 1)
+      (serverChannel, address)
+    }
+
+    // Close the socket if no connection in the configured seconds
+    val timeout = authHelper.conf.get(PYTHON_AUTH_SOCKET_TIMEOUT).toInt
+    logTrace(s"Setting timeout to $timeout sec")
+    if (!isUnixDomainSock) serverSocketChannel.socket().setSoTimeout(timeout * 1000)
 
     new Thread(threadName) {
       setDaemon(true)
       override def run(): Unit = {
-        var sock: Socket = null
+        var sock: SocketChannel = null
         try {
-          sock = serverSocket.accept()
+          if (isUnixDomainSock) {
+            logTrace(s"Waiting for connection on $address.")
+          } else {
+            logTrace(
+              s"Waiting for connection on $address with port " +
+                s"${serverSocketChannel.socket().getLocalPort}")
+          }
+          sock = serverSocketChannel.accept()
+          logTrace(s"Connection accepted from address ${sock.getRemoteAddress}")
           authHelper.authClient(sock)
+          logTrace("Client authenticated")
           promise.complete(Try(handleConnection(sock)))
         } finally {
-          JavaUtils.closeQuietly(serverSocket)
+          logTrace("Closing server")
+          JavaUtils.closeQuietly(serverSocketChannel)
           JavaUtils.closeQuietly(sock)
+          if (isUnixDomainSock) sockPath.delete()
         }
       }
     }.start()
-    (serverSocket.getLocalPort, authHelper.secret)
+    if (isUnixDomainSock) {
+      (sockPath.getPath, null)
+    } else {
+      (serverSocketChannel.socket().getLocalPort, authHelper.secret)
+    }
   }
 
-  val (port, secret) = startServer()
+  // connInfo is either a string (for UDS) or a port number (for TCP/IP).
+  val (connInfo, secret) = startServer()
 
   /**
    * Handle a connection which has already been authenticated.  Any error from this function
    * will clean up this connection and the entire server, and get propagated to [[getResult]].
    */
-  def handleConnection(sock: Socket): T
+  def handleConnection(sock: SocketChannel): T
 
   /**
    * Blocks indefinitely for [[handleConnection]] to finish, and returns that result.  If
@@ -98,9 +136,9 @@ private[spark] abstract class SocketAuthServer[T](
 private[spark] class SocketFuncServer(
     authHelper: SocketAuthHelper,
     threadName: String,
-    func: Socket => Unit) extends SocketAuthServer[Unit](authHelper, threadName) {
+    func: SocketChannel => Unit) extends SocketAuthServer[Unit](authHelper, threadName) {
 
-  override def handleConnection(sock: Socket): Unit = {
+  override def handleConnection(sock: SocketChannel): Unit = {
     func(sock)
   }
 }
@@ -124,8 +162,8 @@ private[spark] object SocketAuthServer {
   def serveToStream(
       threadName: String,
       authHelper: SocketAuthHelper)(writeFunc: OutputStream => Unit): Array[Any] = {
-    val handleFunc = (sock: Socket) => {
-      val out = new BufferedOutputStream(sock.getOutputStream())
+    val handleFunc = (sock: SocketChannel) => {
+      val out = new BufferedOutputStream(Channels.newOutputStream(sock))
       Utils.tryWithSafeFinally {
         writeFunc(out)
       } {
@@ -134,6 +172,6 @@ private[spark] object SocketAuthServer {
     }
 
     val server = new SocketFuncServer(authHelper, threadName, handleFunc)
-    Array(server.port, server.secret, server)
+    Array(server.connInfo, server.secret, server)
   }
 }

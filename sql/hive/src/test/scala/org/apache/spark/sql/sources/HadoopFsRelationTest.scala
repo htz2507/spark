@@ -18,6 +18,7 @@
 package org.apache.spark.sql.sources
 
 import java.io.File
+import java.util.Locale
 
 import scala.util.Random
 
@@ -25,16 +26,17 @@ import org.apache.hadoop.fs.Path
 
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.sql._
+import org.apache.spark.sql.connector.catalog.CatalogManager.SESSION_CATALOG_NAME
 import org.apache.spark.sql.execution.DataSourceScanExec
 import org.apache.spark.sql.execution.datasources._
 import org.apache.spark.sql.hive.test.TestHiveSingleton
+import org.apache.spark.sql.internal.LegacyBehaviorPolicy._
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.internal.SQLConf.LegacyBehaviorPolicy._
-import org.apache.spark.sql.test.SQLTestUtils
 import org.apache.spark.sql.types._
+import org.apache.spark.util.ArrayImplicits._
 
 
-abstract class HadoopFsRelationTest extends QueryTest with SQLTestUtils with TestHiveSingleton {
+abstract class HadoopFsRelationTest extends QueryTest with TestHiveSingleton {
   import spark.implicits._
 
   val dataSourceName: String
@@ -154,13 +156,23 @@ abstract class HadoopFsRelationTest extends QueryTest with SQLTestUtils with Tes
             java8ApiConfValues.foreach { java8Api =>
               withSQLConf(
                 SQLConf.DATETIME_JAVA8API_ENABLED.key -> java8Api.toString,
-                SQLConf.LEGACY_PARQUET_REBASE_MODE_IN_WRITE.key -> CORRECTED.toString,
-                SQLConf.LEGACY_PARQUET_INT96_REBASE_MODE_IN_WRITE.key -> CORRECTED.toString,
-                SQLConf.LEGACY_AVRO_REBASE_MODE_IN_WRITE.key -> CORRECTED.toString) {
+                SQLConf.PARQUET_REBASE_MODE_IN_WRITE.key -> CORRECTED.toString,
+                SQLConf.PARQUET_INT96_REBASE_MODE_IN_WRITE.key -> CORRECTED.toString,
+                SQLConf.AVRO_REBASE_MODE_IN_WRITE.key -> CORRECTED.toString) {
                 val dataGenerator = RandomDataGenerator.forType(
                   dataType = dataType,
                   nullable = true,
-                  new Random(seed)
+                  new Random(seed),
+                  // TODO(SPARK-34440): Allow saving/loading datetime in ORC w/o rebasing
+                  // The ORC datasource always performs datetime rebasing that can lead to
+                  // shifting of the original dates/timestamps. For instance, 1582-10-06 is valid
+                  // date in the Proleptic Gregorian calendar but it does not exist in the Julian
+                  // calendar. The ORC datasource shifts the date to the next valid date 1582-10-15
+                  // during rebasing of this date to the Julian calendar. Since the test compares
+                  // the original date before saving and the date loaded back from the ORC files,
+                  // we set `validJulianDatetime` to `true` to generate only Proleptic Gregorian
+                  // dates that exist in the Julian calendar and will be not changed during rebase.
+                  validJulianDatetime = dataSourceName.toLowerCase(Locale.ROOT).contains("orc")
                 ).getOrElse {
                   fail(s"Failed to create data generator for schema $dataType")
                 }
@@ -228,9 +240,15 @@ abstract class HadoopFsRelationTest extends QueryTest with SQLTestUtils with Tes
 
   test("save()/load() - non-partitioned table - ErrorIfExists") {
     withTempDir { file =>
-      intercept[AnalysisException] {
-        testDF.write.format(dataSourceName).mode(SaveMode.ErrorIfExists).save(file.getCanonicalPath)
-      }
+      checkError(
+        exception = intercept[AnalysisException] {
+          testDF.write.format(dataSourceName)
+            .mode(SaveMode.ErrorIfExists).save(file.getCanonicalPath)
+        },
+        condition = "PATH_ALREADY_EXISTS",
+        parameters = Map("outputPath" -> "file:.*"),
+        matchPVals = true
+      )
     }
   }
 
@@ -327,13 +345,18 @@ abstract class HadoopFsRelationTest extends QueryTest with SQLTestUtils with Tes
 
   test("save()/load() - partitioned table - ErrorIfExists") {
     withTempDir { file =>
-      intercept[AnalysisException] {
-        partitionedTestDF.write
-          .format(dataSourceName)
-          .mode(SaveMode.ErrorIfExists)
-          .partitionBy("p1", "p2")
-          .save(file.getCanonicalPath)
-      }
+      checkError(
+        exception = intercept[AnalysisException] {
+          partitionedTestDF.write
+            .format(dataSourceName)
+            .mode(SaveMode.ErrorIfExists)
+            .partitionBy("p1", "p2")
+            .save(file.getCanonicalPath)
+        },
+        condition = "PATH_ALREADY_EXISTS",
+        parameters = Map("outputPath" -> "file:.*"),
+        matchPVals = true
+      )
     }
   }
 
@@ -370,10 +393,10 @@ abstract class HadoopFsRelationTest extends QueryTest with SQLTestUtils with Tes
   test("saveAsTable()/load() - non-partitioned table - ErrorIfExists") {
     withTable("t") {
       sql(s"CREATE TABLE t(i INT) USING $dataSourceName")
-      val msg = intercept[AnalysisException] {
+      val e = intercept[AnalysisException] {
         testDF.write.format(dataSourceName).mode(SaveMode.ErrorIfExists).saveAsTable("t")
-      }.getMessage
-      assert(msg.contains("Table `t` already exists"))
+      }
+      checkErrorTableAlreadyExists(e, s"`$SESSION_CATALOG_NAME`.`default`.`t`")
     }
   }
 
@@ -584,7 +607,7 @@ abstract class HadoopFsRelationTest extends QueryTest with SQLTestUtils with Tes
       require(dir.listFiles().exists(!_.isDirectory))
       require(subdir.exists())
       require(subdir.listFiles().exists(!_.isDirectory))
-      testWithPath(dir, dataInDir.collect())
+      testWithPath(dir, dataInDir.collect().toImmutableArraySeq)
     }
   }
 
@@ -690,7 +713,7 @@ abstract class HadoopFsRelationTest extends QueryTest with SQLTestUtils with Tes
             .format(dataSourceName)
             .load(path)
           assert(expectedResult.isLeft, s"Error was expected with $path but result found")
-          checkAnswer(testDf, expectedResult.left.get)
+          checkAnswer(testDf, expectedResult.swap.getOrElse(fail()))
         } catch {
           case e: java.util.NoSuchElementException if e.getMessage.contains("dataSchema") =>
             // Ignore error, the source format requires schema to be provided by user
@@ -699,7 +722,7 @@ abstract class HadoopFsRelationTest extends QueryTest with SQLTestUtils with Tes
           case e: Throwable =>
             assert(expectedResult.isRight, s"Was not expecting error with $path: " + e)
             assert(
-              e.getMessage.contains(expectedResult.right.get),
+              e.getMessage.contains(expectedResult.getOrElse(fail())),
               s"Did not find expected error message with $path")
         }
       }
@@ -832,7 +855,9 @@ abstract class HadoopFsRelationTest extends QueryTest with SQLTestUtils with Tes
         assert(preferredLocations.distinct.length == 2)
       }
 
-      withSQLConf(SQLConf.USE_V1_SOURCE_LIST.key -> dataSourceName) {
+      withSQLConf(
+          SQLConf.USE_V1_SOURCE_LIST.key -> dataSourceName,
+          SQLConf.IGNORE_DATA_LOCALITY.key -> "false") {
         checkLocality()
 
         withSQLConf(SQLConf.PARALLEL_PARTITION_DISCOVERY_THRESHOLD.key -> "0") {

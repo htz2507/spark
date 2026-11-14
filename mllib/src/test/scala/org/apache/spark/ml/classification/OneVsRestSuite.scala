@@ -68,6 +68,27 @@ class OneVsRestSuite extends MLTest with DefaultReadWriteTest {
     ParamsSuite.checkParams(model)
   }
 
+  test("SPARK-58250 and SPARK-58509: OneVsRestModel estimated size") {
+    val trainingData = Seq(
+      (0.0, Vectors.dense(0.0, 0.0)),
+      (0.0, Vectors.dense(0.0, 1.0)),
+      (1.0, Vectors.dense(1.0, 0.0)),
+      (1.0, Vectors.dense(1.0, 1.0)),
+      (2.0, Vectors.dense(2.0, 0.0)),
+      (2.0, Vectors.dense(2.0, 1.0))).toDF("label", "features")
+
+    val classifier = new LogisticRegression().setMaxIter(1)
+    // Initialize the classifier's logger before retaining it in the OneVsRestModel.
+    classifier.fit(trainingData)
+    val model = new OneVsRest()
+      .setClassifier(classifier)
+      .fit(trainingData)
+
+    val maxSize = 32 * 1024
+    assert(model.estimatedSize < maxSize,
+      s"Estimation (${model.estimatedSize}) should not include shared runtime state")
+  }
+
   test("one-vs-rest: default params") {
     val numClasses = 3
     val ova = new OneVsRest()
@@ -208,6 +229,26 @@ class OneVsRestSuite extends MLTest with DefaultReadWriteTest {
     // classifier doesn't inherit hasWeightCol
     val ova2 = new OneVsRest().setWeightCol("weight").setClassifier(new FMClassifier())
     assert(ova2.fit(dataset2) !== null)
+  }
+
+  test("SPARK-34045: OneVsRestModel.transform should not call setter of submodels") {
+    val logReg = new LogisticRegression().setMaxIter(1)
+    val ovr = new OneVsRest().setClassifier(logReg)
+    val ovrm = ovr.fit(dataset)
+    val dataset2 = dataset.withColumnRenamed("features", "features2")
+    ovrm.setFeaturesCol("features2")
+
+    val oldCols = ovrm.models.map(_.getFeaturesCol)
+    ovrm.transform(dataset2)
+    val newCols = ovrm.models.map(_.getFeaturesCol)
+    assert(oldCols === newCols)
+  }
+
+  test("SPARK-34356: OneVsRestModel.transform should avoid potential column conflict") {
+    val logReg = new LogisticRegression().setMaxIter(1)
+    val ovr = new OneVsRest().setClassifier(logReg)
+    val ovrm = ovr.fit(dataset)
+    assert(ovrm.transform(dataset.withColumn("probability", lit(0.0))).count() === dataset.count())
   }
 
   test("OneVsRest.copy and OneVsRestModel.copy") {

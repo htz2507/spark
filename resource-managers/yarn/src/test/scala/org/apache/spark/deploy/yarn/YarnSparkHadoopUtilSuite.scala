@@ -18,9 +18,8 @@
 package org.apache.spark.deploy.yarn
 
 import java.io.{File, IOException}
-import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 
-import com.google.common.io.{ByteStreams, Files}
 import org.apache.hadoop.yarn.api.records.ApplicationAccessType
 import org.apache.hadoop.yarn.conf.YarnConfiguration
 import org.scalatest.matchers.must.Matchers
@@ -28,13 +27,10 @@ import org.scalatest.matchers.should.Matchers._
 
 import org.apache.spark.{SecurityManager, SparkConf, SparkFunSuite}
 import org.apache.spark.deploy.SparkHadoopUtil
-import org.apache.spark.internal.Logging
-import org.apache.spark.internal.config._
 import org.apache.spark.internal.config.UI._
 import org.apache.spark.util.{ResetSystemProperties, Utils}
 
-class YarnSparkHadoopUtilSuite extends SparkFunSuite with Matchers with Logging
-  with ResetSystemProperties {
+class YarnSparkHadoopUtilSuite extends SparkFunSuite with Matchers with ResetSystemProperties {
 
   val hasBash =
     try {
@@ -57,12 +53,12 @@ class YarnSparkHadoopUtilSuite extends SparkFunSuite with Matchers with Logging
     val args = Array("arg1", "${arg.2}", "\"arg3\"", "'arg4'", "$arg5", "\\arg6")
     try {
       val argLine = args.map(a => YarnSparkHadoopUtil.escapeForShell(a)).mkString(" ")
-      Files.write(("bash -c \"echo " + argLine + "\"").getBytes(StandardCharsets.UTF_8), scriptFile)
+      Files.writeString(scriptFile.toPath, "bash -c \"echo " + argLine + "\"")
       scriptFile.setExecutable(true)
 
       val proc = Runtime.getRuntime().exec(Array(scriptFile.getAbsolutePath()))
-      val out = new String(ByteStreams.toByteArray(proc.getInputStream())).trim()
-      val err = new String(ByteStreams.toByteArray(proc.getErrorStream()))
+      val out = Utils.toString(proc.getInputStream()).trim()
+      val err = Utils.toString(proc.getErrorStream())
       val exitCode = proc.waitFor()
       exitCode should be (0)
       out should be (args.mkString(" "))
@@ -143,30 +139,43 @@ class YarnSparkHadoopUtilSuite extends SparkFunSuite with Matchers with Logging
 
   }
 
-  test("executorOffHeapMemorySizeAsMb when MEMORY_OFFHEAP_ENABLED is false") {
-    val executorOffHeapMemory = YarnSparkHadoopUtil.executorOffHeapMemorySizeAsMb(new SparkConf())
-    assert(executorOffHeapMemory == 0)
+  test("SPARK-35672: test replaceEnvVars in Unix mode") {
+    Map(
+      "F_O_O$FOO$BAR" -> "F_O_OBAR",
+      "$FOO" -> "BAR",
+      "$F_O_O$FOO" -> "BarBAR",
+      "${FOO}" -> "BAR",
+      "$FOO.baz$BAR" -> "BAR.baz",
+      "{{FOO}}" -> "BAR",
+      "{{FOO}}$FOO" -> "BARBAR",
+      "%FOO%" -> "%FOO%",
+      """\$FOO\\\$FOO\${FOO}\\$FOO\\\\""" -> """$FOO\$FOO${FOO}\BAR\\"""
+    ).foreach { case (input, expected) =>
+      withClue(s"input string `$input`: ") {
+        val replaced = YarnSparkHadoopUtil
+          .replaceEnvVars(input, Map("F_O_O" -> "Bar", "FOO" -> "BAR"), isWindows = false)
+        assert(replaced === expected)
+      }
+    }
   }
 
-  test("executorOffHeapMemorySizeAsMb when MEMORY_OFFHEAP_ENABLED is true") {
-    val offHeapMemoryInMB = 50
-    val offHeapMemory: Long = offHeapMemoryInMB * 1024 * 1024
-    val sparkConf = new SparkConf()
-      .set(MEMORY_OFFHEAP_ENABLED, true)
-      .set(MEMORY_OFFHEAP_SIZE, offHeapMemory)
-    val executorOffHeapMemory = YarnSparkHadoopUtil.executorOffHeapMemorySizeAsMb(sparkConf)
-    assert(executorOffHeapMemory == offHeapMemoryInMB)
+  test("SPARK-35672: test replaceEnvVars in Windows mode") {
+    Map(
+      "Foo%FOO%%BAR%" -> "FooBAR",
+      "%FOO%" -> "BAR",
+      "%F_O_O%%FOO%" -> "BarBAR",
+      "{{FOO}}%FOO%" -> "BARBAR",
+      "$FOO" -> "$FOO",
+      "${FOO}" -> "${FOO}",
+      "%%FOO%%%FOO%%%%%%FOO%" -> "%FOO%BAR%%BAR",
+      "%FOO%^^^%FOO^%^FOO^^^^%FOO%" -> "BAR^%FOO%^FOO^^BAR"
+    ).foreach { case (input, expected) =>
+      withClue(s"input string `$input`: ") {
+        val replaced = YarnSparkHadoopUtil
+          .replaceEnvVars(input, Map("F_O_O" -> "Bar", "FOO" -> "BAR"), isWindows = true)
+        assert(replaced === expected)
+      }
+    }
   }
 
-  test("executorMemoryOverhead when MEMORY_OFFHEAP_ENABLED is true, " +
-    "but MEMORY_OFFHEAP_SIZE not config scene") {
-    val sparkConf = new SparkConf()
-      .set(MEMORY_OFFHEAP_ENABLED, true)
-    val expected =
-      s"${MEMORY_OFFHEAP_SIZE.key} must be > 0 when ${MEMORY_OFFHEAP_ENABLED.key} == true"
-    val message = intercept[IllegalArgumentException] {
-      YarnSparkHadoopUtil.executorOffHeapMemorySizeAsMb(sparkConf)
-    }.getMessage
-    assert(message.contains(expected))
-  }
 }

@@ -20,7 +20,7 @@ package org.apache.spark.sql.hive.execution
 import java.io._
 import java.util.Properties
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
 import org.apache.hadoop.conf.Configuration
@@ -42,12 +42,12 @@ import org.apache.spark.util.{CircularBuffer, Utils}
 /**
  * Transforms the input by forking and running the specified script.
  *
- * @param input the set of expression that should be passed to the script.
  * @param script the command that should be executed.
  * @param output the attributes that are produced by the script.
+ * @param child logical plan whose output is transformed.
+ * @param ioschema the class set that defines how to handle input/output data.
  */
-case class HiveScriptTransformationExec(
-    input: Seq[Expression],
+private[hive] case class HiveScriptTransformationExec(
     script: String,
     output: Seq[Attribute],
     child: SparkPlan,
@@ -64,7 +64,6 @@ case class HiveScriptTransformationExec(
       outputSoi: StructObjectInspector,
       hadoopConf: Configuration): Iterator[InternalRow] = {
     new Iterator[InternalRow] with HiveInspectors {
-      var curLine: String = null
       val scriptOutputStream = new DataInputStream(inputStream)
 
       val scriptOutputReader =
@@ -78,6 +77,9 @@ case class HiveScriptTransformationExec(
       lazy val unwrappers = outputSoi.getAllStructFieldRefs.asScala.map(unwrapperFor)
 
       override def hasNext: Boolean = {
+        if (writerThread.outputReadToEnd) {
+          return false
+        }
         try {
           if (scriptOutputWritable == null) {
             scriptOutputWritable = reusedWritableObject
@@ -85,6 +87,7 @@ case class HiveScriptTransformationExec(
             if (scriptOutputReader != null) {
               if (scriptOutputReader.next(scriptOutputWritable) <= 0) {
                 checkFailureAndPropagate(writerThread, null, proc, stderrBuffer)
+                writerThread.outputReadToEnd = true
                 return false
               }
             } else {
@@ -92,11 +95,12 @@ case class HiveScriptTransformationExec(
                 scriptOutputWritable.readFields(scriptOutputStream)
               } catch {
                 case _: EOFException =>
-                  // This means that the stdout of `proc` (ie. TRANSFORM process) has exhausted.
+                  // This means that the stdout of `proc` (i.e. TRANSFORM process) has exhausted.
                   // Ideally the proc should *not* be alive at this point but
                   // there can be a lag between EOF being written out and the process
                   // being terminated. So explicitly waiting for the process to be done.
                   checkFailureAndPropagate(writerThread, null, proc, stderrBuffer)
+                  writerThread.outputReadToEnd = true
                   return false
               }
             }
@@ -129,6 +133,10 @@ case class HiveScriptTransformationExec(
           }
           i += 1
         }
+        // Read ahead, as the iterator without serde does: the task may not call `hasNext` again,
+        // as under a LIMIT, so the end of the output must also be recorded here. The unwrappers
+        // copy the values, so reading the next row into the reused writable keeps `mutableRow`.
+        hasNext
         mutableRow
       }
     }
@@ -140,14 +148,14 @@ case class HiveScriptTransformationExec(
 
     val (outputStream, proc, inputStream, stderrBuffer) = initProc
 
-    val (inputSerde, inputSoi) = initInputSerDe(ioschema, input).getOrElse((null, null))
+    val (inputSerde, inputSoi) = initInputSerDe(ioschema, child.output).getOrElse((null, null))
 
     // For HiveScriptTransformationExec, if inputSerde == null, but outputSerde != null
     // We will use StringBuffer to pass data, in this case, we should cast data as string too.
     val finalInput = if (inputSerde == null) {
       inputExpressionsWithoutSerde
     } else {
-      input
+      child.output
     }
 
     val outputProjection = new InterpretedProjection(finalInput, child.output)
@@ -178,13 +186,16 @@ case class HiveScriptTransformationExec(
         writerThread, inputStream, proc, stderrBuffer, outputSerde, outputSoi, hadoopConf)
     }
 
-    writerThread.start()
+    startWriterThread(writerThread)
 
     outputIterator
   }
+
+  override protected def withNewChildInternal(newChild: SparkPlan): HiveScriptTransformationExec =
+    copy(child = newChild)
 }
 
-case class HiveScriptTransformationWriterThread(
+private[hive] case class HiveScriptTransformationWriterThread(
     iter: Iterator[InternalRow],
     inputSchema: Seq[DataType],
     inputSerde: AbstractSerDe,
@@ -275,9 +286,7 @@ object HiveScriptIOSchema extends HiveInspectors {
     propsMap = propsMap + (serdeConstants.LIST_COLUMN_TYPES -> columnTypesNames)
 
     val properties = new Properties()
-    // Can not use properties.putAll(propsMap.asJava) in scala-2.12
-    // See https://github.com/scala/bug/issues/10418
-    propsMap.foreach { case (k, v) => properties.put(k, v) }
+    properties.putAll(propsMap.asJava)
     serde.initialize(null, properties)
 
     serde
@@ -291,9 +300,7 @@ object HiveScriptIOSchema extends HiveInspectors {
       val instance = Utils.classForName[RecordReader](klass).getConstructor().
         newInstance()
       val props = new Properties()
-      // Can not use props.putAll(outputSerdeProps.toMap.asJava) in scala-2.12
-      // See https://github.com/scala/bug/issues/10418
-      ioschema.outputSerdeProps.toMap.foreach { case (k, v) => props.put(k, v) }
+      props.putAll(ioschema.outputSerdeProps.toMap.asJava)
       instance.initialize(inputStream, conf, props)
       instance
     }

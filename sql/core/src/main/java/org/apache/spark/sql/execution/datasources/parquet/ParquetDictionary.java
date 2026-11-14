@@ -21,19 +21,32 @@ import org.apache.spark.sql.execution.vectorized.Dictionary;
 
 public final class ParquetDictionary implements Dictionary {
   private org.apache.parquet.column.Dictionary dictionary;
+  private boolean needTransform = false;
 
-  public ParquetDictionary(org.apache.parquet.column.Dictionary dictionary) {
+  public ParquetDictionary(org.apache.parquet.column.Dictionary dictionary, boolean needTransform) {
     this.dictionary = dictionary;
+    this.needTransform = needTransform;
   }
 
   @Override
   public int decodeToInt(int id) {
-    return dictionary.decodeToInt(id);
+    if (needTransform) {
+      return (int) dictionary.decodeToLong(id);
+    } else {
+      return dictionary.decodeToInt(id);
+    }
   }
 
   @Override
   public long decodeToLong(int id) {
-    return dictionary.decodeToLong(id);
+    if (needTransform) {
+      // For unsigned int32, it stores as dictionary encoded signed int32 in Parquet
+      // whenever dictionary is available.
+      // Here we lazily decode it to the original signed int value then convert to long(unit32).
+      return Integer.toUnsignedLong(dictionary.decodeToInt(id));
+    } else {
+      return dictionary.decodeToLong(id);
+    }
   }
 
   @Override
@@ -48,6 +61,14 @@ public final class ParquetDictionary implements Dictionary {
 
   @Override
   public byte[] decodeToBinary(int id) {
-    return dictionary.decodeToBinary(id).getBytes();
+    if (needTransform) {
+      // For unsigned int64, it stores as dictionary encoded signed int64 in Parquet
+      // whenever dictionary is available.
+      // Here we lazily decode it to the original signed long value then convert to decimal(20, 0).
+      long signed = dictionary.decodeToLong(id);
+      return VectorizedReaderBase.unsignedLongToBytesBigEndian(signed);
+    } else {
+      return dictionary.decodeToBinary(id).getBytesUnsafe();
+    }
   }
 }

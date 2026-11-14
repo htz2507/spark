@@ -19,36 +19,19 @@ package org.apache.spark.rdd
 
 import java.io.File
 
-import scala.collection.JavaConverters._
-
-import org.apache.commons.io.FileUtils
-import org.apache.commons.io.filefilter.TrueFileFilter
-import org.scalatest.BeforeAndAfterEach
+import scala.jdk.CollectionConverters._
 
 import org.apache.spark._
 import org.apache.spark.util.Utils
 
 
-class RDDCleanerSuite extends SparkFunSuite with BeforeAndAfterEach {
-  override def beforeEach(): Unit = {
-    super.beforeEach()
-    // Once `Utils.getOrCreateLocalRootDirs` is called, it is cached in `Utils.localRootDirs`.
-    // Unless this is manually cleared before and after a test, it returns the same directory
-    // set before even if 'spark.local.dir' is configured afterwards.
-    Utils.clearLocalRootDirs()
-  }
-
-  override def afterEach(): Unit = {
-    Utils.clearLocalRootDirs()
-    super.afterEach()
-  }
+class RDDCleanerSuite extends SparkFunSuite with LocalRootDirsTest {
 
   test("RDD shuffle cleanup standalone") {
     val conf = new SparkConf()
     val localDir = Utils.createTempDir()
     val checkpointDir = Utils.createTempDir()
-    def getAllFiles: Set[File] =
-      FileUtils.listFiles(localDir, TrueFileFilter.INSTANCE, TrueFileFilter.INSTANCE).asScala.toSet
+    def getAllFiles: Set[File] = Utils.listFiles(localDir).asScala.toSet
     try {
       conf.set("spark.local.dir", localDir.getAbsolutePath)
       val sc = new SparkContext("local[2]", "test", conf)
@@ -60,7 +43,7 @@ class RDDCleanerSuite extends SparkFunSuite with BeforeAndAfterEach {
         val shuffled = keyed.reduceByKey(_ + _)
         val keysOnly = shuffled.keys
         keysOnly.count()
-        assert(getAllFiles.size > 0)
+        assert(getAllFiles.nonEmpty)
         keysOnly.cleanShuffleDependencies(true)
         val resultingFiles = getAllFiles
         assert(resultingFiles === Set())

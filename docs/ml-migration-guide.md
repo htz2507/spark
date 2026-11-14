@@ -26,6 +26,25 @@ Note that this migration guide describes the items specific to MLlib.
 Many items of SQL migration can be applied when migrating MLlib to higher versions for DataFrame-based APIs.
 Please refer [Migration Guide: SQL, Datasets and DataFrame](sql-migration-guide.html).
 
+## Upgrading from MLlib 3.5 to 4.0
+
+### Breaking changes
+{:.no_toc}
+
+There are no breaking changes.
+
+### Deprecations and changes of behavior
+{:.no_toc}
+
+**Deprecations**
+
+There are no deprecations.
+
+**Changes of behavior**
+
+* [SPARK-51132](https://issues.apache.org/jira/browse/SPARK-51132):
+  The PMML XML schema version of exported PMML format models by [PMML model export](mllib-pmml-model-export.html) has been upgraded from `PMML-4_3` to `PMML-4_4`.
+
 ## Upgrading from MLlib 2.4 to 3.0
 
 ### Breaking changes
@@ -58,7 +77,7 @@ Please refer [Migration Guide: SQL, Datasets and DataFrame](sql-migration-guide.
 **Deprecations**
 
 * [SPARK-11215](https://issues.apache.org/jira/browse/SPARK-11215):
-`labels` in `StringIndexerModel` is deprecated and will be removed in 3.1.0. Use `labelsArray` instead.
+`labels` in `StringIndexerModel` is deprecated. Use `labelsArray` instead.
 * [SPARK-25758](https://issues.apache.org/jira/browse/SPARK-25758):
 `computeCost` in `BisectingKMeansModel` is deprecated and will be removed in future versions. Use `ClusteringEvaluator` instead.
 
@@ -223,6 +242,23 @@ for converting to `ml.linalg` types, and
 for converting to `mllib.linalg` types.
 
 <div class="codetabs">
+
+<div data-lang="python"  markdown="1">
+
+{% highlight python %}
+from pyspark.mllib.util import MLUtils
+
+# convert DataFrame columns
+convertedVecDF = MLUtils.convertVectorColumnsToML(vecDF)
+convertedMatrixDF = MLUtils.convertMatrixColumnsToML(matrixDF)
+# convert a single vector or matrix
+mlVec = mllibVec.asML()
+mlMat = mllibMat.asML()
+{% endhighlight %}
+
+Refer to the [`MLUtils` Python docs](api/python/reference/api/pyspark.mllib.util.MLUtils.html#pyspark.mllib.util.MLUtils) for further detail.
+</div>
+
 <div data-lang="scala"  markdown="1">
 
 {% highlight scala %}
@@ -256,21 +292,6 @@ org.apache.spark.ml.linalg.Matrix mlMat = mllibMat.asML();
 Refer to the [`MLUtils` Java docs](api/java/org/apache/spark/mllib/util/MLUtils.html) for further detail.
 </div>
 
-<div data-lang="python"  markdown="1">
-
-{% highlight python %}
-from pyspark.mllib.util import MLUtils
-
-# convert DataFrame columns
-convertedVecDF = MLUtils.convertVectorColumnsToML(vecDF)
-convertedMatrixDF = MLUtils.convertMatrixColumnsToML(matrixDF)
-# convert a single vector or matrix
-mlVec = mllibVec.asML()
-mlMat = mllibMat.asML()
-{% endhighlight %}
-
-Refer to the [`MLUtils` Python docs](api/python/pyspark.mllib.html#pyspark.mllib.util.MLUtils) for further detail.
-</div>
 </div>
 
 **Deprecated methods removed**
@@ -281,7 +302,7 @@ Several deprecated methods were removed in the `spark.mllib` and `spark.ml` pack
 * `weights` in `LinearRegression` and `LogisticRegression` in `spark.ml`
 * `setMaxNumIterations` in `mllib.optimization.LBFGS` (marked as `DeveloperApi`)
 * `treeReduce` and `treeAggregate` in `mllib.rdd.RDDFunctions` (these functions are available on `RDD`s directly, and were marked as `DeveloperApi`)
-* `defaultStategy` in `mllib.tree.configuration.Strategy`
+* `defaultStrategy` in `mllib.tree.configuration.Strategy`
 * `build` in `mllib.tree.Node`
 * libsvm loaders for multiclass and load/save labeledData methods in `mllib.util.MLUtils`
 

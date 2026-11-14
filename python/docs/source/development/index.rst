@@ -20,9 +20,12 @@ Development
 ===========
 
 .. toctree::
-    :maxdepth: 2
+   :maxdepth: 2
 
-    contributing
-    testing
-    debugging
-    setting_ide
+   contributing
+   testing
+   debugging
+   setting_ide
+   logger
+   errors
+

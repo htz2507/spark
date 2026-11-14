@@ -19,7 +19,7 @@ package org.apache.spark.ml.regression
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.ml.feature.LabeledPoint
-import org.apache.spark.ml.linalg.Vector
+import org.apache.spark.ml.linalg.{Vector, Vectors}
 import org.apache.spark.ml.tree.impl.TreeTests
 import org.apache.spark.ml.util.{DefaultReadWriteTest, MLTest, MLTestingUtils}
 import org.apache.spark.ml.util.TestingUtils._
@@ -29,6 +29,7 @@ import org.apache.spark.mllib.tree.{DecisionTree => OldDecisionTree,
 import org.apache.spark.mllib.util.LinearDataGenerator
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, Row}
+import org.apache.spark.util.ArrayImplicits._
 
 class DecisionTreeRegressorSuite extends MLTest with DefaultReadWriteTest {
 
@@ -43,7 +44,8 @@ class DecisionTreeRegressorSuite extends MLTest with DefaultReadWriteTest {
   override def beforeAll(): Unit = {
     super.beforeAll()
     categoricalDataPointsRDD =
-      sc.parallelize(OldDecisionTreeSuite.generateCategoricalDataPoints().map(_.asML))
+      sc.parallelize(OldDecisionTreeSuite.generateCategoricalDataPoints().map(_.asML)
+        .toImmutableArraySeq)
     linearRegressionData = sc.parallelize(LinearDataGenerator.generateLinearInput(
       intercept = 6.3, weights = Array(4.7, 7.2), xMean = Array(0.9, -1.3),
       xVariance = Array(0.7, 1.2), nPoints = 1000, seed, eps = 0.5), 2).map(_.asML).toDF()
@@ -53,12 +55,21 @@ class DecisionTreeRegressorSuite extends MLTest with DefaultReadWriteTest {
   // Tests calling train()
   /////////////////////////////////////////////////////////////////////////////
 
+  test("DecisionTreeRegressor validate input dataset") {
+    testInvalidRegressionLabels(new DecisionTreeRegressor().fit(_))
+    testInvalidWeights(new DecisionTreeRegressor().setWeightCol("weight").fit(_))
+    testInvalidVectors(new DecisionTreeRegressor().fit(_))
+  }
+
   test("Regression stump with 3-ary (ordered) categorical features") {
     val dt = new DecisionTreeRegressor()
       .setImpurity("variance")
       .setMaxDepth(2)
       .setMaxBins(100)
       .setSeed(1)
+    assert(dt.getIntermediateStorageLevel === "MEMORY_AND_DISK")
+    dt.setIntermediateStorageLevel("DISK_ONLY")
+    assert(dt.getIntermediateStorageLevel === "DISK_ONLY")
     val categoricalFeatures = Map(0 -> 3, 1 -> 3)
     compareAPIs(categoricalDataPointsRDD, dt, categoricalFeatures)
   }
@@ -166,7 +177,7 @@ class DecisionTreeRegressorSuite extends MLTest with DefaultReadWriteTest {
     val data = TreeTests.getSingleTreeLeafData
     data.foreach { case (leafId, vec) => assert(leafId === model.predictLeaf(vec)) }
 
-    val df = sc.parallelize(data, 1).toDF("leafId", "features")
+    val df = sc.parallelize(data.toImmutableArraySeq, 1).toDF("leafId", "features")
     model.transform(df).select("leafId", "predictedLeafId")
       .collect()
       .foreach { case Row(leafId: Double, predictedLeafId: Double) =>
@@ -214,6 +225,8 @@ class DecisionTreeRegressorSuite extends MLTest with DefaultReadWriteTest {
         model2: DecisionTreeRegressionModel): Unit = {
       TreeTests.checkEqual(model, model2)
       assert(model.numFeatures === model2.numFeatures)
+      val features = Vectors.dense(0.0, 0.0)
+      assert(model.predictLeaf(features) === model2.predictLeaf(features))
     }
 
     val dt = new DecisionTreeRegressor()
@@ -236,6 +249,20 @@ class DecisionTreeRegressorSuite extends MLTest with DefaultReadWriteTest {
       TreeTests.allParamSettings ++ Map("maxDepth" -> 0),
       TreeTests.allParamSettings ++ Map("maxDepth" -> 0), checkModelData)
   }
+
+  test("SPARK-33398: Load DecisionTreeRegressionModel prior to Spark 3.0") {
+    val path = testFile("ml-models/dtr-2.4.7")
+    val model = DecisionTreeRegressionModel.load(path)
+    assert(model.numFeatures === 692)
+    assert(model.numNodes === 5)
+    assert(model.featureImportances ~==
+      Vectors.sparse(692, Array(100, 434),
+        Array(0.03987240829346093, 0.960127591706539)) absTol 1e-4)
+
+    val metadata = spark.read.json(s"$path/metadata")
+    val sparkVersionStr = metadata.select("sparkVersion").first().getString(0)
+    assert(sparkVersionStr === "2.4.7")
+  }
 }
 
 private[ml] object DecisionTreeRegressorSuite extends SparkFunSuite {
@@ -248,7 +275,8 @@ private[ml] object DecisionTreeRegressorSuite extends SparkFunSuite {
       data: RDD[LabeledPoint],
       dt: DecisionTreeRegressor,
       categoricalFeatures: Map[Int, Int]): Unit = {
-    val numFeatures = data.first().features.size
+    val vec = data.first().features
+    val numFeatures = vec.size
     val oldStrategy = dt.getOldStrategy(categoricalFeatures)
     val oldTree = OldDecisionTree.train(data.map(OldLabeledPoint.fromML), oldStrategy)
     val newData: DataFrame = TreeTests.setMetadata(data, categoricalFeatures, numClasses = 0)
@@ -257,6 +285,7 @@ private[ml] object DecisionTreeRegressorSuite extends SparkFunSuite {
     val oldTreeAsNew = DecisionTreeRegressionModel.fromOld(
       oldTree, newTree.parent.asInstanceOf[DecisionTreeRegressor], categoricalFeatures)
     TreeTests.checkEqual(oldTreeAsNew, newTree)
+    assert(oldTreeAsNew.predictLeaf(vec) === newTree.predictLeaf(vec))
     assert(newTree.numFeatures === numFeatures)
   }
 }

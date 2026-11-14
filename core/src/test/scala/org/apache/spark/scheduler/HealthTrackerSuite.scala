@@ -20,15 +20,13 @@ package org.apache.spark.scheduler
 import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito.{never, verify, when}
 import org.mockito.invocation.InvocationOnMock
-import org.scalatest.BeforeAndAfterEach
 import org.scalatestplus.mockito.MockitoSugar
 
 import org.apache.spark._
 import org.apache.spark.internal.config
 import org.apache.spark.util.ManualClock
 
-class HealthTrackerSuite extends SparkFunSuite with BeforeAndAfterEach with MockitoSugar
-    with LocalSparkContext {
+class HealthTrackerSuite extends SparkFunSuite with MockitoSugar with LocalSparkContext {
 
   private val clock = new ManualClock(0)
 
@@ -62,11 +60,11 @@ class HealthTrackerSuite extends SparkFunSuite with BeforeAndAfterEach with Mock
   // All executors and hosts used in tests should be in this set, so that [[assertEquivalentToSet]]
   // works.  Its OK if its got extraneous entries
   val allExecutorAndHostIds = {
-    (('A' to 'Z')++ (1 to 100).map(_.toString))
-      .flatMap{ suffix =>
+    ('A' to 'Z')
+      .flatMap { suffix =>
         Seq(s"host$suffix", s"host-$suffix")
       }
-  }.toSet
+  }.toSet ++ (1 to 100).map(_.toString)
 
   /**
    * Its easier to write our tests as if we could directly look at the sets of nodes & executors in
@@ -429,10 +427,10 @@ class HealthTrackerSuite extends SparkFunSuite with BeforeAndAfterEach with Mock
     assert(!HealthTracker.isExcludeOnFailureEnabled(conf))
     conf.set(config.EXCLUDE_ON_FAILURE_LEGACY_TIMEOUT_CONF, 5000L)
     assert(HealthTracker.isExcludeOnFailureEnabled(conf))
-    assert(5000 === HealthTracker.getExludeOnFailureTimeout(conf))
+    assert(5000 === HealthTracker.getExcludeOnFailureTimeout(conf))
     // the new conf takes precedence, though
     conf.set(config.EXCLUDE_ON_FAILURE_TIMEOUT_CONF, 1000L)
-    assert(1000 === HealthTracker.getExludeOnFailureTimeout(conf))
+    assert(1000 === HealthTracker.getExcludeOnFailureTimeout(conf))
 
     // if you explicitly set the legacy conf to 0, that also would disable excluding
     conf.set(config.EXCLUDE_ON_FAILURE_LEGACY_TIMEOUT_CONF, 0L)
@@ -440,7 +438,24 @@ class HealthTrackerSuite extends SparkFunSuite with BeforeAndAfterEach with Mock
     // but again, the new conf takes precedence
     conf.set(config.EXCLUDE_ON_FAILURE_ENABLED, true)
     assert(HealthTracker.isExcludeOnFailureEnabled(conf))
-    assert(1000 === HealthTracker.getExludeOnFailureTimeout(conf))
+    assert(1000 === HealthTracker.getExcludeOnFailureTimeout(conf))
+  }
+
+  test("SPARK-49252: check exclusion enabling config on the application level") {
+    val conf = new SparkConf().setMaster("local")
+    assert(!HealthTracker.isExcludeOnFailureEnabled(conf))
+    conf.set(config.EXCLUDE_ON_FAILURE_ENABLED, true)
+    assert(HealthTracker.isExcludeOnFailureEnabled(conf))
+    // Turn off taskset level exclusion, application level healthtracker should still be enabled.
+    conf.set(config.EXCLUDE_ON_FAILURE_ENABLED_TASK_AND_STAGE, false)
+    assert(HealthTracker.isExcludeOnFailureEnabled(conf))
+    // Turn off the application level exclusion specifically, this overrides the global setting.
+    conf.set(config.EXCLUDE_ON_FAILURE_ENABLED_APPLICATION, false)
+    conf.set(config.EXCLUDE_ON_FAILURE_ENABLED_TASK_AND_STAGE, false)
+    assert(!HealthTracker.isExcludeOnFailureEnabled(conf))
+    // Turn on application level exclusion, health tracker should be enabled.
+    conf.set(config.EXCLUDE_ON_FAILURE_ENABLED_APPLICATION, true)
+    assert(HealthTracker.isExcludeOnFailureEnabled(conf))
   }
 
   test("check exclude configuration invariants") {
@@ -552,6 +567,51 @@ class HealthTrackerSuite extends SparkFunSuite with BeforeAndAfterEach with Mock
 
     verify(allocationClientMock).killExecutors(Seq("2"), false, false, true)
     verify(allocationClientMock).killExecutorsOnHost("hostA")
+  }
+
+  test("excluding decommission and kills executors when enabled") {
+    val allocationClientMock = mock[ExecutorAllocationClient]
+
+    // verify we decommission when configured
+    conf.set(config.EXCLUDE_ON_FAILURE_KILL_ENABLED, true)
+    conf.set(config.DECOMMISSION_ENABLED.key, "true")
+    conf.set(config.EXCLUDE_ON_FAILURE_DECOMMISSION_ENABLED.key, "true")
+    conf.set(config.MAX_FAILURES_PER_EXEC.key, "1")
+    conf.set(config.MAX_FAILED_EXEC_PER_NODE.key, "2")
+    healthTracker = new HealthTracker(listenerBusMock, conf, Some(allocationClientMock), clock)
+
+    // Fail 4 tasks in one task set on executor 1, so that executor gets excluded for the whole
+    // application.
+    val taskSetExclude2 = createTaskSetExcludelist(stageId = 0)
+    (0 until 4).foreach { partition =>
+      taskSetExclude2.updateExcludedForFailedTask(
+        "hostA", exec = "1", index = partition, failureReason = "testing")
+    }
+    healthTracker.updateExcludedForSuccessfulTaskSet(0, 0, taskSetExclude2.execToFailures)
+
+    val msg1 =
+      "Killing excluded executor id 1 since spark.excludeOnFailure.killExcludedExecutors is set." +
+      " (actually decommissioning)"
+
+    verify(allocationClientMock).decommissionExecutor(
+      "1", ExecutorDecommissionInfo(msg1), false)
+
+    val taskSetExclude3 = createTaskSetExcludelist(stageId = 1)
+    // Fail 4 tasks in one task set on executor 2, so that executor gets excluded for the whole
+    // application.  Since that's the second executor that is excluded on the same node, we also
+    // exclude that node.
+    (0 until 4).foreach { partition =>
+      taskSetExclude3.updateExcludedForFailedTask(
+        "hostA", exec = "2", index = partition, failureReason = "testing")
+    }
+    healthTracker.updateExcludedForSuccessfulTaskSet(0, 0, taskSetExclude3.execToFailures)
+
+    val msg2 =
+      "Killing excluded executor id 2 since spark.excludeOnFailure.killExcludedExecutors is set." +
+      " (actually decommissioning)"
+    verify(allocationClientMock).decommissionExecutor(
+      "2", ExecutorDecommissionInfo(msg2), false, false)
+    verify(allocationClientMock).decommissionExecutorsOnHost("hostA")
   }
 
   test("fetch failure excluding kills executors, configured by EXCLUDE_ON_FAILURE_KILL_ENABLED") {

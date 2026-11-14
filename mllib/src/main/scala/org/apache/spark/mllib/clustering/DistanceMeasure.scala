@@ -41,7 +41,7 @@ private[spark] abstract class DistanceMeasure extends Serializable {
    *         1, if i != j: a bound r = matrix(i,j) to help avoiding unnecessary distance
    *         computation. Given point x, let i be current closest center, and d be current best
    *         distance, if d < f(r), then we no longer need to compute the distance to center j;
-   *         2, if i == j: a bound r = matrix(i,i) = min_k{maxtrix(i,k)|k!=i}. If distance
+   *         2, if i == j: a bound r = matrix(i,i) = min_k{matrix(i,k)|k!=i}. If distance
    *         between point x and center i is less than f(r), then center i is the closest center
    *         to point x.
    */
@@ -101,7 +101,7 @@ private[spark] abstract class DistanceMeasure extends Serializable {
             } else Iterator.empty
           }
         }
-      }.collect.foreach { case (i, j, s) =>
+      }.collect().foreach { case (i, j, s) =>
         val index = indexUpperTriangular(k, i, j)
         packedValues(index) = s
         if (s < diagValues(i)) diagValues(i) = s
@@ -115,6 +115,24 @@ private[spark] abstract class DistanceMeasure extends Serializable {
       i += 1
     }
     packedValues
+  }
+
+  /**
+   * @param centers the clustering centers
+   * @param statistics optional statistics to accelerate the computation, which should not
+   *                   change the result.
+   * @param point given point
+   * @return the index of the closest center to the given point, as well as the cost.
+   */
+  def findClosest(
+      centers: Array[VectorWithNorm],
+      statistics: Option[Array[Double]],
+      point: VectorWithNorm): (Int, Double) = {
+    if (statistics.nonEmpty) {
+      findClosest(centers, statistics.get, point)
+    } else {
+      findClosest(centers, point)
+    }
   }
 
   /**
@@ -240,8 +258,8 @@ object DistanceMeasure {
 
   private[spark] def decodeFromString(distanceMeasure: String): DistanceMeasure =
     distanceMeasure match {
-      case EUCLIDEAN => new EuclideanDistanceMeasure
-      case COSINE => new CosineDistanceMeasure
+      case EUCLIDEAN => EuclideanDistanceMeasure
+      case COSINE => CosineDistanceMeasure
       case _ => throw new IllegalArgumentException(s"distanceMeasure must be one of: " +
         s"$EUCLIDEAN, $COSINE. $distanceMeasure provided.")
     }
@@ -253,9 +271,14 @@ object DistanceMeasure {
       case _ => false
     }
   }
+
+  private[clustering] def shouldComputeStatistics(k: Int): Boolean = k < 1000
+
+  private[clustering] def shouldComputeStatisticsLocally(k: Int, numFeatures: Int): Boolean =
+    k.toLong * k * numFeatures < 1000000
 }
 
-private[spark] class EuclideanDistanceMeasure extends DistanceMeasure {
+private[spark] object EuclideanDistanceMeasure extends DistanceMeasure {
 
   /**
    * Statistics used in triangle inequality to obtain useful bounds to find closest centers.
@@ -268,7 +291,7 @@ private[spark] class EuclideanDistanceMeasure extends DistanceMeasure {
    *         squared distance, if d < r, then we no longer need to compute the distance to center
    *         j. matrix(i,j) equals to squared of half of Euclidean distance between centers i
    *         and j;
-   *         2, if i == j: a bound r = matrix(i,i) = min_k{maxtrix(i,k)|k!=i}. If squared
+   *         2, if i == j: a bound r = matrix(i,i) = min_k{matrix(i,k)|k!=i}. If squared
    *         distance between point x and center i is less than r, then center i is the closest
    *         center to point x.
    */
@@ -377,10 +400,7 @@ private[spark] class EuclideanDistanceMeasure extends DistanceMeasure {
       centroid: VectorWithNorm): Double = {
     EuclideanDistanceMeasure.fastSquaredDistance(point, centroid)
   }
-}
 
-
-private[spark] object EuclideanDistanceMeasure {
   /**
    * @return the squared Euclidean distance between two vectors computed by
    * [[org.apache.spark.mllib.util.MLUtils#fastSquaredDistance]].
@@ -392,7 +412,7 @@ private[spark] object EuclideanDistanceMeasure {
   }
 }
 
-private[spark] class CosineDistanceMeasure extends DistanceMeasure {
+private[spark] object CosineDistanceMeasure extends DistanceMeasure {
 
   /**
    * Statistics used in triangle inequality to obtain useful bounds to find closest centers.
@@ -405,7 +425,7 @@ private[spark] class CosineDistanceMeasure extends DistanceMeasure {
    *         is used instead of Cosine distance to compute matrix(i,j): for centers i and j,
    *         compute the radian/angle between them, halving it, and converting it back to Cosine
    *         distance at the end;
-   *         2, if i == j: a bound r = matrix(i,i) = min_k{maxtrix(i,k)|k!=i}. If Cosine
+   *         2, if i == j: a bound r = matrix(i,i) = min_k{matrix(i,k)|k!=i}. If Cosine
    *         distance between point x and center i is less than r, then center i is the closest
    *         center to point x.
    */

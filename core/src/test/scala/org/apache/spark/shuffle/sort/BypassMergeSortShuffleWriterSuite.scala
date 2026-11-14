@@ -22,24 +22,28 @@ import java.util.UUID
 
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
+import scala.util.Random
 
 import org.mockito.{Mock, MockitoAnnotations}
 import org.mockito.Answers.RETURNS_SMART_NULLS
 import org.mockito.ArgumentMatchers.{any, anyInt, anyLong}
 import org.mockito.Mockito._
-import org.scalatest.BeforeAndAfterEach
 
 import org.apache.spark._
 import org.apache.spark.executor.{ShuffleWriteMetrics, TaskMetrics}
+import org.apache.spark.internal.config
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
+import org.apache.spark.network.shuffle.checksum.ShuffleChecksumHelper
 import org.apache.spark.serializer.{JavaSerializer, SerializerInstance, SerializerManager}
-import org.apache.spark.shuffle.IndexShuffleBlockResolver
+import org.apache.spark.shuffle.{IndexShuffleBlockResolver, ShuffleChecksumTestHelper}
 import org.apache.spark.shuffle.api.ShuffleExecutorComponents
 import org.apache.spark.shuffle.sort.io.LocalDiskShuffleExecutorComponents
 import org.apache.spark.storage._
 import org.apache.spark.util.Utils
 
-class BypassMergeSortShuffleWriterSuite extends SparkFunSuite with BeforeAndAfterEach {
+class BypassMergeSortShuffleWriterSuite
+  extends SparkFunSuite
+    with ShuffleChecksumTestHelper {
 
   @Mock(answer = RETURNS_SMART_NULLS) private var blockManager: BlockManager = _
   @Mock(answer = RETURNS_SMART_NULLS) private var diskBlockManager: DiskBlockManager = _
@@ -59,7 +63,7 @@ class BypassMergeSortShuffleWriterSuite extends SparkFunSuite with BeforeAndAfte
 
   override def beforeEach(): Unit = {
     super.beforeEach()
-    MockitoAnnotations.initMocks(this)
+    MockitoAnnotations.openMocks(this).close()
     tempDir = Utils.createTempDir()
     outputFile = File.createTempFile("shuffle", null, tempDir)
     taskMetrics = new TaskMetrics
@@ -69,17 +73,16 @@ class BypassMergeSortShuffleWriterSuite extends SparkFunSuite with BeforeAndAfte
     )
     val memoryManager = new TestMemoryManager(conf)
     val taskMemoryManager = new TaskMemoryManager(memoryManager, 0)
-    when(dependency.partitioner).thenReturn(new HashPartitioner(7))
-    when(dependency.serializer).thenReturn(new JavaSerializer(conf))
+    resetDependency(conf, rowBasedChecksumEnabled = false)
     when(taskContext.taskMetrics()).thenReturn(taskMetrics)
     when(blockResolver.getDataFile(0, 0)).thenReturn(outputFile)
     when(blockManager.diskBlockManager).thenReturn(diskBlockManager)
     when(taskContext.taskMemoryManager()).thenReturn(taskMemoryManager)
 
-    when(blockResolver.writeIndexFileAndCommit(
-      anyInt, anyLong, any(classOf[Array[Long]]), any(classOf[File])))
+    when(blockResolver.writeMetadataFileAndCommit(
+      anyInt, anyLong, any(classOf[Array[Long]]), any(classOf[Array[Long]]), any(classOf[File])))
       .thenAnswer { invocationOnMock =>
-        val tmp = invocationOnMock.getArguments()(3).asInstanceOf[File]
+        val tmp = invocationOnMock.getArguments()(4).asInstanceOf[File]
         if (tmp != null) {
           outputFile.delete
           tmp.renameTo(outputFile)
@@ -104,6 +107,12 @@ class BypassMergeSortShuffleWriterSuite extends SparkFunSuite with BeforeAndAfte
           syncWrites = false,
           args(4).asInstanceOf[ShuffleWriteMetrics],
           blockId = args(0).asInstanceOf[BlockId])
+      }
+
+    when(blockResolver.createTempFile(any(classOf[File])))
+      .thenAnswer { invocationOnMock =>
+        val file = invocationOnMock.getArguments()(0).asInstanceOf[File]
+        Utils.tempFileWith(file)
       }
 
     when(diskBlockManager.createTempShuffleBlock())
@@ -134,6 +143,20 @@ class BypassMergeSortShuffleWriterSuite extends SparkFunSuite with BeforeAndAfte
     }
   }
 
+  private def resetDependency(sc: SparkConf, rowBasedChecksumEnabled: Boolean): Unit = {
+    reset(dependency)
+    val numPartitions = 7
+    when(dependency.partitioner).thenReturn(new HashPartitioner(numPartitions))
+    when(dependency.serializer).thenReturn(new JavaSerializer(sc))
+    val checksumSize = if (rowBasedChecksumEnabled) {
+      numPartitions
+    } else {
+      0
+    }
+    val rowBasedChecksums = createPartitionRowBasedChecksums(checksumSize)
+    when(dependency.rowBasedChecksums).thenReturn(rowBasedChecksums)
+  }
+
   test("write empty iterator") {
     val writer = new BypassMergeSortShuffleWriter[Int, Int](
       blockManager,
@@ -158,7 +181,8 @@ class BypassMergeSortShuffleWriterSuite extends SparkFunSuite with BeforeAndAfte
 
   Seq(true, false).foreach { transferTo =>
     test(s"write with some empty partitions - transferTo $transferTo") {
-      val transferConf = conf.clone.set("spark.file.transferTo", transferTo.toString)
+      val transferConf =
+        conf.clone.set(config.SHUFFLE_MERGE_PREFER_NIO.key, transferTo.toString)
       def records: Iterator[(Int, Int)] =
         Iterator((1, 1), (5, 5)) ++ (0 until 100000).iterator.map(x => (2, 2))
       val writer = new BypassMergeSortShuffleWriter[Int, Int](
@@ -235,5 +259,91 @@ class BypassMergeSortShuffleWriterSuite extends SparkFunSuite with BeforeAndAfte
     assert(temporaryFilesCreated.nonEmpty)
     writer.stop( /* success = */ false)
     assert(temporaryFilesCreated.count(_.exists()) === 0)
+  }
+
+  test("write checksum file") {
+    val blockResolver = new IndexShuffleBlockResolver(conf, blockManager)
+    val shuffleId = shuffleHandle.shuffleId
+    val mapId = 0
+    val checksumBlockId = ShuffleChecksumBlockId(shuffleId, mapId, 0)
+    val dataBlockId = ShuffleDataBlockId(shuffleId, mapId, 0)
+    val indexBlockId = ShuffleIndexBlockId(shuffleId, mapId, 0)
+    val checksumAlgorithm = conf.get(config.SHUFFLE_CHECKSUM_ALGORITHM)
+    val checksumFileName = ShuffleChecksumHelper.getChecksumFileName(
+      checksumBlockId.name, checksumAlgorithm)
+    val checksumFile = new File(tempDir, checksumFileName)
+    val dataFile = new File(tempDir, dataBlockId.name)
+    val indexFile = new File(tempDir, indexBlockId.name)
+    reset(diskBlockManager)
+    when(diskBlockManager.getFile(checksumFileName)).thenAnswer(_ => checksumFile)
+    when(diskBlockManager.getFile(dataBlockId)).thenAnswer(_ => dataFile)
+    when(diskBlockManager.getFile(indexBlockId)).thenAnswer(_ => indexFile)
+    when(diskBlockManager.createTempShuffleBlock())
+      .thenAnswer { _ =>
+        val blockId = new TempShuffleBlockId(UUID.randomUUID)
+        val file = new File(tempDir, blockId.name)
+        temporaryFilesCreated += file
+        (blockId, file)
+      }
+    when(diskBlockManager.createTempFileWith(any(classOf[File])))
+      .thenAnswer { invocationOnMock =>
+        val file = invocationOnMock.getArguments()(0).asInstanceOf[File]
+        Utils.tempFileWith(file)
+      }
+
+    val numPartition = shuffleHandle.dependency.partitioner.numPartitions
+    val writer = new BypassMergeSortShuffleWriter[Int, Int](
+      blockManager,
+      shuffleHandle,
+      mapId,
+      conf,
+      taskContext.taskMetrics().shuffleWriteMetrics,
+      new LocalDiskShuffleExecutorComponents(conf, blockManager, blockResolver))
+
+    writer.write(Iterator((0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)))
+    writer.stop( /* success = */ true)
+    assert(checksumFile.exists())
+    assert(checksumFile.length() === 8 * numPartition)
+    compareChecksums(numPartition, checksumAlgorithm, checksumFile, dataFile, indexFile)
+  }
+
+  test("Row-based checksums are independent of input row order") {
+    val records: List[(Int, Int)] = List(
+      (1, 1), (1, 2), (1, 3), (1, 4), (1, 5),
+      (2, 2), (2, 3), (2, 4), (2, 5), (2, 6),
+      (3, 3), (3, 4), (3, 5), (3, 6), (3, 7),
+      (4, 4), (4, 5), (4, 6), (4, 7), (4, 8),
+      (5, 5), (5, 6), (5, 7), (5, 8), (5, 9),
+      (6, 6), (6, 7), (6, 8), (6, 9), (6, 10),
+      (7, 7), (7, 8), (7, 9), (7, 10), (7, 11))
+
+    var checksumValues : Array[Long] = Array[Long]()
+    var aggregatedChecksumValue = 0L
+    for (i <- 1 to 100) {
+      resetDependency(conf, rowBasedChecksumEnabled = true)
+      val writer = new BypassMergeSortShuffleWriter[Int, Int](
+        blockManager,
+        shuffleHandle,
+        0L, // MapId
+        conf,
+        taskContext.taskMetrics().shuffleWriteMetrics,
+        shuffleExecutorComponents)
+
+      writer.write(Random.shuffle(records).iterator)
+      writer.stop(/* success = */ true)
+
+      if(i == 1) {
+        checksumValues = getRowBasedChecksumValues(writer.getRowBasedChecksums)
+        assert(checksumValues.length > 0)
+        assert(checksumValues.forall(_ > 0))
+
+        aggregatedChecksumValue = writer.getAggregatedChecksumValue()
+        assert(aggregatedChecksumValue != 0)
+      } else {
+        assert(checksumValues.sameElements(
+          getRowBasedChecksumValues(writer.getRowBasedChecksums)))
+        assert(aggregatedChecksumValue == writer.getAggregatedChecksumValue())
+      }
+    }
   }
 }

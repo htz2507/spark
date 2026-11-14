@@ -21,20 +21,22 @@ import org.apache.spark.annotation.Evolving;
 
 /**
  * An interface that defines how to write the data to data source for batch processing.
- *
+ * <p>
  * The writing procedure is:
- *   1. Create a writer factory by {@link #createBatchWriterFactory(PhysicalWriteInfo)}, serialize
- *      and send it to all the partitions of the input data(RDD).
- *   2. For each partition, create the data writer, and write the data of the partition with this
- *      writer. If all the data are written successfully, call {@link DataWriter#commit()}. If
- *      exception happens during the writing, call {@link DataWriter#abort()}.
- *   3. If all writers are successfully committed, call {@link #commit(WriterCommitMessage[])}. If
- *      some writers are aborted, or the job failed with an unknown reason, call
- *      {@link #abort(WriterCommitMessage[])}.
- *
+ * <ol>
+ *   <li>Create a writer factory by {@link #createBatchWriterFactory(PhysicalWriteInfo)}, serialize
+ *     and send it to all the partitions of the input data(RDD).</li>
+ *   <li>For each partition, create the data writer, and write the data of the partition with this
+ *     writer. If all the data are written successfully, call {@link DataWriter#commit()}. If
+ *     exception happens during the writing, call {@link DataWriter#abort()}.</li>
+ *   <li>If all writers are successfully committed, call {@link #commit(WriterCommitMessage[])}. If
+ *     some writers are aborted, or the job failed with an unknown reason, call
+ *     {@link #abort(WriterCommitMessage[])}.</li>
+ * </ol>
+ * <p>
  * While Spark will retry failed writing tasks, Spark won't retry failed writing jobs. Users should
  * do it manually in their Spark applications if they want to retry.
- *
+ * <p>
  * Please refer to the documentation of commit/abort methods for detailed specifications.
  *
  * @since 3.0.0
@@ -44,7 +46,7 @@ public interface BatchWrite {
 
   /**
    * Creates a writer factory which will be serialized and sent to executors.
-   *
+   * <p>
    * If this method fails (by throwing an exception), the action will fail and no Spark job will be
    * submitted.
    *
@@ -83,8 +85,38 @@ public interface BatchWrite {
    * disable this behavior by overriding {@link #useCommitCoordinator()}. If disabled, multiple
    * tasks may have committed successfully and one successful commit message per task will be
    * passed to this commit method. The remaining commit messages are ignored by Spark.
+   * <p>
+   * Note: this method signals that all data for this write operation has been successfully written.
+   * When this write is part of a
+   * {@link org.apache.spark.sql.connector.catalog.transactions.Transaction}, connector
+   * implementations should stage the written data durably but must not make it visible to readers.
+   * Changes are propagated and made visible only when the enclosing transaction is committed via
+   * {@link org.apache.spark.sql.connector.catalog.transactions.Transaction#commit()}.
    */
   void commit(WriterCommitMessage[] messages);
+
+  /**
+   * Commits this writing job with a list of commit messages and write summary.
+   * <p>
+   * If this method fails (by throwing an exception), this writing job is considered to to have been
+   * failed, and {@link #abort(WriterCommitMessage[])} would be called. The state of the destination
+   * is undefined and @{@link #abort(WriterCommitMessage[])} may not be able to deal with it.
+   * <p>
+   * Note that speculative execution may cause multiple tasks to run for a partition. By default,
+   * Spark uses the commit coordinator to allow at most one task to commit. Implementations can
+   * disable this behavior by overriding {@link #useCommitCoordinator()}. If disabled, multiple
+   * tasks may have committed successfully and one successful commit message per task will be
+   * passed to this commit method. The remaining commit messages are ignored by Spark.
+   * <p>
+   * @param messages a list of commit messages from successful data writers, produced by
+   *                 {@link DataWriter#commit()}.
+   * @param summary an informational summary collected in a best-effort from the operation
+   *                producing write. Currently supported summary fields are provided through
+   *                implementations of {@link WriteSummary}.
+   */
+  default void commit(WriterCommitMessage[] messages, WriteSummary summary) {
+    commit(messages);
+  }
 
   /**
    * Aborts this writing job because some data writers are failed and keep failing when retry,

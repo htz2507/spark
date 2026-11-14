@@ -23,7 +23,6 @@ import scala.concurrent.{Future, Promise}
 import scala.concurrent.duration.Duration
 import scala.reflect.ClassTag
 
-import org.apache.spark.internal.Logging
 import org.apache.spark.network.buffer.{FileSegmentManagedBuffer, ManagedBuffer, NioManagedBuffer}
 import org.apache.spark.network.shuffle.{BlockFetchingListener, BlockStoreClient, DownloadFileManager}
 import org.apache.spark.storage.{BlockId, EncryptedManagedBuffer, StorageLevel}
@@ -63,7 +62,11 @@ abstract class BlockTransferService extends BlockStoreClient {
       blockId: BlockId,
       blockData: ManagedBuffer,
       level: StorageLevel,
-      classTag: ClassTag[_]): Future[Unit]
+      classTag: ClassTag[_],
+      // Source replica's content checksum and seal-path mark, so the receiver can verify and record
+      // them (see BlockManager.BlockStoreUpdater.save).
+      checksum: Option[Long] = None,
+      verifySealedChecksum: Boolean = false): Future[Unit]
 
   /**
    * A special case of [[fetchBlocks]], as it fetches only one block and is blocking.
@@ -118,8 +121,11 @@ abstract class BlockTransferService extends BlockStoreClient {
       blockId: BlockId,
       blockData: ManagedBuffer,
       level: StorageLevel,
-      classTag: ClassTag[_]): Unit = {
-    val future = uploadBlock(hostname, port, execId, blockId, blockData, level, classTag)
+      classTag: ClassTag[_],
+      checksum: Option[Long] = None,
+      verifySealedChecksum: Boolean = false): Unit = {
+    val future = uploadBlock(hostname, port, execId, blockId, blockData, level, classTag,
+      checksum, verifySealedChecksum)
     ThreadUtils.awaitResult(future, Duration.Inf)
   }
 }

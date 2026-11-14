@@ -17,13 +17,14 @@
 
 package org.apache.spark.sql.catalyst.optimizer
 
-import org.apache.spark.sql.catalyst.expressions.{And, ArrayExists, ArrayFilter, CaseWhen, Expression, If}
-import org.apache.spark.sql.catalyst.expressions.{LambdaFunction, Literal, MapFilter, Or}
-import org.apache.spark.sql.catalyst.expressions.Literal.FalseLiteral
-import org.apache.spark.sql.catalyst.plans.logical.{Filter, Join, LogicalPlan}
+import org.apache.spark.SparkIllegalArgumentException
+import org.apache.spark.internal.LogKeys.{SQL_TEXT, UNSUPPORTED_EXPR}
+import org.apache.spark.sql.catalyst.expressions.{And, ArrayExists, ArrayFilter, CaseWhen, EqualNullSafe, Expression, If, In, InSet, IsNotNull, LambdaFunction, Like, Literal, MapFilter, Not, Or}
+import org.apache.spark.sql.catalyst.expressions.Literal.{FalseLiteral, TrueLiteral}
+import org.apache.spark.sql.catalyst.plans.logical.{DeleteAction, DeleteFromTable, Filter, InsertAction, InsertStarAction, Join, LogicalPlan, MergeAction, MergeIntoTable, ReplaceData, UpdateAction, UpdateStarAction, UpdateTable, WriteDelta}
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.BooleanType
+import org.apache.spark.sql.catalyst.trees.TreePattern.{INSET, LIKE_FAMLIY, NULL_LITERAL, TRUE_OR_FALSE_LITERAL}
+import org.apache.spark.sql.types.{BooleanType, StringType}
 import org.apache.spark.util.Utils
 
 
@@ -51,10 +52,34 @@ import org.apache.spark.util.Utils
  */
 object ReplaceNullWithFalseInPredicate extends Rule[LogicalPlan] {
 
-  def apply(plan: LogicalPlan): LogicalPlan = plan transform {
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(
+    _.containsAnyPattern(NULL_LITERAL, TRUE_OR_FALSE_LITERAL, INSET, LIKE_FAMLIY), ruleId) {
     case f @ Filter(cond, _) => f.copy(condition = replaceNullWithFalse(cond))
     case j @ Join(_, _, _, Some(cond), _) => j.copy(condition = Some(replaceNullWithFalse(cond)))
-    case p: LogicalPlan => p transformExpressions {
+    case rd @ ReplaceData(_, cond, _, _, _, groupFilterCond, _) =>
+      val newCond = replaceNullWithFalse(cond)
+      val newGroupFilterCond = groupFilterCond.map(replaceNullWithFalse)
+      rd.copy(condition = newCond, groupFilterCondition = newGroupFilterCond)
+    case wd @ WriteDelta(_, cond, _, _, _, groupFilterCond, _) =>
+      val newCond = replaceNullWithFalse(cond)
+      val newGroupFilterCond = groupFilterCond.map(replaceNullWithFalse)
+      wd.copy(condition = newCond, groupFilterCondition = newGroupFilterCond)
+    case d @ DeleteFromTable(_, cond) => d.copy(condition = replaceNullWithFalse(cond))
+    case u @ UpdateTable(_, _, Some(cond)) => u.copy(condition = Some(replaceNullWithFalse(cond)))
+    case m: MergeIntoTable =>
+      m.copy(
+        mergeCondition = replaceNullWithFalse(m.mergeCondition),
+        matchedActions = replaceNullWithFalse(m.matchedActions),
+        notMatchedActions = replaceNullWithFalse(m.notMatchedActions),
+        notMatchedBySourceActions = replaceNullWithFalse(m.notMatchedBySourceActions))
+    case p: LogicalPlan => p.transformExpressionsWithPruning(
+      _.containsAnyPattern(NULL_LITERAL, TRUE_OR_FALSE_LITERAL), ruleId) {
+      // For `EqualNullSafe` with a `TrueLiteral`, whether the other side is null or false has no
+      // difference, as `null <=> true` and `false <=> true` both return false.
+      case EqualNullSafe(left, TrueLiteral) =>
+        EqualNullSafe(replaceNullWithFalse(left), TrueLiteral)
+      case EqualNullSafe(TrueLiteral, right) =>
+        EqualNullSafe(TrueLiteral, replaceNullWithFalse(right))
       case i @ If(pred, _, _) => i.copy(predicate = replaceNullWithFalse(pred))
       case cw @ CaseWhen(branches, _) =>
         val newBranches = branches.map { case (cond, value) =>
@@ -74,8 +99,9 @@ object ReplaceNullWithFalseInPredicate extends Rule[LogicalPlan] {
   }
 
   /**
-   * Recursively traverse the Boolean-type expression to replace
-   * `Literal(null, BooleanType)` with `FalseLiteral`, if possible.
+   * Recursively traverse the Boolean-type expression to replace, where possible,
+   * `Literal(null, BooleanType)` with `FalseLiteral` -- and, in the same null-as-false spirit
+   * within a predicate, a match-all `x LIKE '%'` with `IsNotNull(x)`.
    *
    * Note that `transformExpressionsDown` can not be used here as we must stop as soon as we hit
    * an expression that is not [[CaseWhen]], [[If]], [[And]], [[Or]] or
@@ -84,6 +110,25 @@ object ReplaceNullWithFalseInPredicate extends Rule[LogicalPlan] {
   private def replaceNullWithFalse(e: Expression): Expression = e match {
     case Literal(null, BooleanType) =>
       FalseLiteral
+    // In SQL, the `Not(IN)` expression evaluates as follows:
+    // `NULL not in (1)` -> NULL
+    // `NULL not in (1, NULL)` -> NULL
+    // `1 not in (1, NULL)` -> false
+    // `1 not in (2, NULL)` -> NULL
+    // In predicate, NULL is equal to false, so we can simplify them to false directly.
+    case Not(In(value, list)) if (value +: list).exists(isNullLiteral) =>
+      FalseLiteral
+    case Not(InSet(value, list)) if isNullLiteral(value) || list.contains(null) =>
+      FalseLiteral
+
+    // `x LIKE '%'` (a pattern of only unescaped `%`) is true for any non-null value and null for
+    // null. In a predicate, null is treated as false, so it is equivalent to `IsNotNull(x)`,
+    // which is cheaper and can be pushed down. This case is reached only through null-preserving
+    // operators, so it never fires under `Not`, where the rewrite would be unsafe.
+    case Like(child, Literal(pattern, _: StringType), escapeChar)
+        if pattern != null && isMatchAllLikePattern(pattern.toString, escapeChar) =>
+      IsNotNull(child)
+
     case And(left, right) =>
       And(replaceNullWithFalse(left), replaceNullWithFalse(right))
     case Or(left, right) =>
@@ -92,20 +137,47 @@ object ReplaceNullWithFalseInPredicate extends Rule[LogicalPlan] {
       val newBranches = cw.branches.map { case (cond, value) =>
         replaceNullWithFalse(cond) -> replaceNullWithFalse(value)
       }
-      val newElseValue = cw.elseValue.map(replaceNullWithFalse)
+      val newElseValue = cw.elseValue.map(replaceNullWithFalse).getOrElse(FalseLiteral)
       CaseWhen(newBranches, newElseValue)
     case i @ If(pred, trueVal, falseVal) if i.dataType == BooleanType =>
       If(replaceNullWithFalse(pred), replaceNullWithFalse(trueVal), replaceNullWithFalse(falseVal))
     case e if e.dataType == BooleanType =>
       e
     case e =>
-      val message = "Expected a Boolean type expression in replaceNullWithFalse, " +
-        s"but got the type `${e.dataType.catalogString}` in `${e.sql}`."
       if (Utils.isTesting) {
-        throw new IllegalArgumentException(message)
+        throw new SparkIllegalArgumentException(
+          errorClass = "_LEGACY_ERROR_TEMP_3215",
+          messageParameters = Map(
+            "dataType" -> e.dataType.catalogString,
+            "expr" -> e.sql))
       } else {
+        val message = log"Expected a Boolean type expression in replaceNullWithFalse, " +
+          log"but got the type `${MDC(UNSUPPORTED_EXPR, e.dataType.catalogString)}` " +
+          log"in `${MDC(SQL_TEXT, e.sql)}`."
         logWarning(message)
         e
       }
   }
+
+  private def replaceNullWithFalse(mergeActions: Seq[MergeAction]): Seq[MergeAction] = {
+    mergeActions.map {
+      case u @ UpdateAction(Some(cond), _, _) =>
+        u.copy(condition = Some(replaceNullWithFalse(cond)))
+      case u @ UpdateStarAction(Some(cond)) => u.copy(condition = Some(replaceNullWithFalse(cond)))
+      case d @ DeleteAction(Some(cond)) => d.copy(condition = Some(replaceNullWithFalse(cond)))
+      case i @ InsertAction(Some(cond), _) => i.copy(condition = Some(replaceNullWithFalse(cond)))
+      case i @ InsertStarAction(Some(cond)) => i.copy(condition = Some(replaceNullWithFalse(cond)))
+      case other => other
+    }
+  }
+
+  private def isNullLiteral(e: Expression): Boolean = e match {
+    case Literal(null, _) => true
+    case _ => false
+  }
+
+  // A `LIKE` pattern that matches any non-null value: one or more `%` wildcards and nothing else.
+  // `%` must be an actual wildcard, so the escape character must not be `%`.
+  private def isMatchAllLikePattern(pattern: String, escapeChar: Char): Boolean =
+    escapeChar != '%' && pattern.nonEmpty && pattern.forall(_ == '%')
 }

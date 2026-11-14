@@ -25,6 +25,7 @@ import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateFunction, DeclarativeAggregate, TypedImperativeAggregate}
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateSafeProjection
 import org.apache.spark.sql.catalyst.expressions.objects.Invoke
+import org.apache.spark.sql.catalyst.trees.TreePattern.{TreePattern, USER_DEFINED_AGGREGATION}
 import org.apache.spark.sql.expressions.Aggregator
 import org.apache.spark.sql.types._
 import org.apache.spark.util.Utils
@@ -106,7 +107,7 @@ trait TypedAggregateExpression extends AggregateFunction {
 
   // aggregator.getClass.getSimpleName can cause Malformed class name error,
   // call safer `Utils.getSimpleName` instead
-  override def nodeName: String = Utils.getSimpleName(aggregator.getClass).stripSuffix("$");
+  override def nodeName: String = Utils.getSimpleName(aggregator.getClass).stripSuffix("$")
 }
 
 // TODO: merge these 2 implementations once we refactor the `AggregateFunction` interface.
@@ -124,6 +125,8 @@ case class SimpleTypedAggregateExpression(
     dataType: DataType,
     nullable: Boolean)
   extends DeclarativeAggregate with TypedAggregateExpression with NonSQLExpression {
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(USER_DEFINED_AGGREGATION)
 
   override lazy val deterministic: Boolean = true
 
@@ -203,6 +206,10 @@ case class SimpleTypedAggregateExpression(
       schema: StructType): TypedAggregateExpression = {
     copy(inputDeserializer = Some(deser), inputClass = Some(cls), inputSchema = Some(schema))
   }
+
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[Expression]): SimpleTypedAggregateExpression =
+    super.legacyWithNewChildren(newChildren).asInstanceOf[SimpleTypedAggregateExpression]
 }
 
 case class ComplexTypedAggregateExpression(
@@ -218,6 +225,8 @@ case class ComplexTypedAggregateExpression(
     mutableAggBufferOffset: Int = 0,
     inputAggBufferOffset: Int = 0)
   extends TypedImperativeAggregate[Any] with TypedAggregateExpression with NonSQLExpression {
+
+  final override val nodePatterns: Seq[TreePattern] = Seq(USER_DEFINED_AGGREGATION)
 
   override lazy val deterministic: Boolean = true
 
@@ -285,4 +294,8 @@ case class ComplexTypedAggregateExpression(
       schema: StructType): TypedAggregateExpression = {
     copy(inputDeserializer = Some(deser), inputClass = Some(cls), inputSchema = Some(schema))
   }
+
+  override protected def withNewChildrenInternal(
+      newChildren: IndexedSeq[Expression]): ComplexTypedAggregateExpression =
+    super.legacyWithNewChildren(newChildren).asInstanceOf[ComplexTypedAggregateExpression]
 }

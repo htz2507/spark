@@ -18,10 +18,13 @@
 package org.apache.spark.sql.catalyst.rules
 
 import org.apache.spark.internal.Logging
+import org.apache.spark.sql.catalyst.SQLConfHelper
 import org.apache.spark.sql.catalyst.trees.TreeNode
-import org.apache.spark.sql.internal.SQLConf
 
-abstract class Rule[TreeType <: TreeNode[_]] extends Logging {
+abstract class Rule[TreeType <: TreeNode[_]] extends SQLConfHelper with Logging {
+
+  // The integer id of a rule, for pruning unnecessary tree traversals.
+  protected lazy val ruleId = RuleIdCollection.getRuleId(this.ruleName)
 
   /** Name for this rule, automatically inferred based on class name. */
   val ruleName: String = {
@@ -30,6 +33,4 @@ abstract class Rule[TreeType <: TreeNode[_]] extends Logging {
   }
 
   def apply(plan: TreeType): TreeType
-
-  def conf: SQLConf = SQLConf.get
 }

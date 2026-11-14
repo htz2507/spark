@@ -27,6 +27,7 @@ import org.apache.spark.sql.catalyst.CatalystTypeConverters
 import org.apache.spark.sql.catalyst.plans.SQLHelper
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
+import org.apache.spark.sql.types.DataTypeTestUtils.{dayTimeIntervalTypes, yearMonthIntervalTypes}
 
 /**
  * Tests of [[RandomDataGenerator]].
@@ -142,5 +143,35 @@ class RandomDataGeneratorSuite extends SparkFunSuite with SQLHelper {
     val array2 = ByteBuffer.allocate(8).putDouble(nan2).array
     assert(!Arrays.equals(array1, arrayExpected))
     assert(Arrays.equals(array2, arrayExpected))
+  }
+
+  // Geospatial types:
+  for (nullable <- Seq(true, false)) {
+    test(s"GeometryType with fixed SRID (nullable=$nullable)") {
+      testRandomDataGeneration(GeometryType(4326), nullable)
+    }
+    test(s"GeometryType with mixed SRID (nullable=$nullable)") {
+      testRandomDataGeneration(GeometryType("ANY"), nullable)
+    }
+    test(s"GeographyType with fixed SRID (nullable=$nullable)") {
+      testRandomDataGeneration(GeographyType(4326), nullable)
+    }
+    test(s"GeographyType with mixed SRID (nullable=$nullable)") {
+      testRandomDataGeneration(GeographyType("ANY"), nullable)
+    }
+  }
+
+  test("SPARK-35116: The generated data fits the precision of DayTimeIntervalType in spark") {
+    (dayTimeIntervalTypes ++ yearMonthIntervalTypes).foreach { dt =>
+      for (seed <- 1 to 1000) {
+        val generator = RandomDataGenerator.forType(dt, false, new Random(seed)).get
+        val toCatalyst = CatalystTypeConverters.createToCatalystConverter(dt)
+        val toScala = CatalystTypeConverters.createToScalaConverter(dt)
+        val data = generator.apply()
+        val catalyst = toCatalyst(data)
+        val convertedBack = toScala(catalyst)
+        assert(data == convertedBack)
+      }
+    }
   }
 }

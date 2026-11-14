@@ -19,21 +19,27 @@ package org.apache.spark.sql.execution.datasources.parquet
 
 import java.io.File
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.reflect.ClassTag
 import scala.reflect.runtime.universe.TypeTag
 
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
+import org.apache.parquet.HadoopReadOptions
+import org.apache.parquet.column.ParquetProperties
 import org.apache.parquet.format.converter.ParquetMetadataConverter
-import org.apache.parquet.hadoop.{Footer, ParquetFileReader, ParquetFileWriter}
+import org.apache.parquet.hadoop.{Footer, ParquetFileReader, ParquetFileWriter, ParquetOutputFormat}
 import org.apache.parquet.hadoop.metadata.{BlockMetaData, FileMetaData, ParquetMetadata}
+import org.apache.parquet.hadoop.util.HadoopInputFile
 import org.apache.parquet.schema.MessageType
 
+import org.apache.spark.TestUtils
 import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.catalyst.ScalaReflection
 import org.apache.spark.sql.execution.datasources.FileBasedDataSourceTest
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.util.Utils
 
 /**
  * A helper trait that provides convenient facilities for Parquet testing.
@@ -47,6 +53,8 @@ private[sql] trait ParquetTest extends FileBasedDataSourceTest {
   override protected val dataSourceName: String = "parquet"
   override protected val vectorizedReaderEnabledKey: String =
     SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key
+  override protected val vectorizedReaderNestedEnabledKey: String =
+    SQLConf.PARQUET_VECTORIZED_READER_NESTED_COLUMN_ENABLED.key
 
   /**
    * Reads the parquet file at `path`
@@ -98,7 +106,7 @@ private[sql] trait ParquetTest extends FileBasedDataSourceTest {
       new File(parent, child)
     }
 
-    assert(partDir.mkdirs(), s"Couldn't create directory $partDir")
+    assert(Utils.createDirectory(partDir), s"Couldn't create directory $partDir")
     partDir
   }
 
@@ -135,9 +143,9 @@ private[sql] trait ParquetTest extends FileBasedDataSourceTest {
   }
 
   protected def readFooter(path: Path, configuration: Configuration): ParquetMetadata = {
-    ParquetFileReader.readFooter(
-      configuration,
-      new Path(path, ParquetFileWriter.PARQUET_METADATA_FILE),
+    ParquetFooterReader.readFooter(
+      HadoopInputFile.fromPath(
+        new Path(path, ParquetFileWriter.PARQUET_METADATA_FILE), configuration),
       ParquetMetadataConverter.NO_FILTER)
   }
 
@@ -159,10 +167,43 @@ private[sql] trait ParquetTest extends FileBasedDataSourceTest {
     Thread.currentThread().getContextClassLoader.getResource(name).toString
   }
 
+  protected def schemaFor[T: TypeTag]: StructType = ScalaReflection.encoderFor[T].schema
+
   def withAllParquetReaders(code: => Unit): Unit = {
     // test the row-based reader
-    withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key -> "false")(code)
+    withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key -> "false") {
+      withClue("Parquet-mr reader") {
+        code
+      }
+    }
     // test the vectorized reader
-    withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key -> "true")(code)
+    withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key -> "true") {
+      withClue("Vectorized reader") {
+        code
+      }
+    }
+  }
+
+  def withAllParquetWriters(code: => Unit): Unit = {
+    // Parquet version 1
+    withSQLConf(ParquetOutputFormat.WRITER_VERSION ->
+      ParquetProperties.WriterVersion.PARQUET_1_0.toString)(code)
+    // Parquet version 2
+    withSQLConf(ParquetOutputFormat.WRITER_VERSION ->
+      ParquetProperties.WriterVersion.PARQUET_2_0.toString)(code)
+  }
+
+  def getMetaData(dir: java.io.File): Map[String, String] = {
+    val file = TestUtils.listDirectory(dir).head
+    val conf = new Configuration()
+    val hadoopInputFile = HadoopInputFile.fromPath(new Path(file), conf)
+    val parquetReadOptions = HadoopReadOptions.builder(conf).build()
+    val m = ParquetFileReader.open(hadoopInputFile, parquetReadOptions)
+    val metadata = try {
+      m.getFileMetaData.getKeyValueMetaData
+    } finally {
+      m.close()
+    }
+    metadata.asScala.toMap
   }
 }

@@ -17,7 +17,8 @@
 
 package org.apache.spark.network.shuffle.protocol;
 
-import com.google.common.base.Objects;
+import java.util.Objects;
+
 import io.netty.buffer.ByteBuf;
 
 import org.apache.spark.network.protocol.Encoders;
@@ -25,16 +26,24 @@ import org.apache.spark.network.protocol.Encoders;
 /**
  * Request to finalize merge for a given shuffle.
  * Returns {@link MergeStatuses}
+ *
+ * @since 3.1.0
  */
 public class FinalizeShuffleMerge extends BlockTransferMessage {
   public final String appId;
+  public final int appAttemptId;
   public final int shuffleId;
+  public final int shuffleMergeId;
 
   public FinalizeShuffleMerge(
       String appId,
-      int shuffleId) {
+      int appAttemptId,
+      int shuffleId,
+      int shuffleMergeId) {
     this.appId = appId;
+    this.appAttemptId = appAttemptId;
     this.shuffleId = shuffleId;
+    this.shuffleMergeId = shuffleMergeId;
   }
 
   @Override
@@ -44,41 +53,44 @@ public class FinalizeShuffleMerge extends BlockTransferMessage {
 
   @Override
   public int hashCode() {
-    return Objects.hashCode(appId, shuffleId);
+    return Objects.hash(appId, appAttemptId, shuffleId, shuffleMergeId);
   }
 
   @Override
   public String toString() {
-    return Objects.toStringHelper(this)
-      .add("appId", appId)
-      .add("shuffleId", shuffleId)
-      .toString();
+    return "FinalizeShuffleMerge[appId=" + appId + ",attemptId=" + appAttemptId +
+        ",shuffleId=" + shuffleId + ",shuffleMergeId=" + shuffleMergeId + "]";
   }
 
   @Override
   public boolean equals(Object other) {
-    if (other != null && other instanceof FinalizeShuffleMerge) {
-      FinalizeShuffleMerge o = (FinalizeShuffleMerge) other;
-      return Objects.equal(appId, o.appId)
-        && shuffleId == o.shuffleId;
+    if (other instanceof FinalizeShuffleMerge o) {
+      return Objects.equals(appId, o.appId)
+        && appAttemptId == o.appAttemptId
+        && shuffleId == o.shuffleId
+        && shuffleMergeId == o.shuffleMergeId;
     }
     return false;
   }
 
   @Override
   public int encodedLength() {
-    return Encoders.Strings.encodedLength(appId) + 4;
+    return Encoders.Strings.encodedLength(appId) + 4 + 4 + 4;
   }
 
   @Override
   public void encode(ByteBuf buf) {
     Encoders.Strings.encode(buf, appId);
+    buf.writeInt(appAttemptId);
     buf.writeInt(shuffleId);
+    buf.writeInt(shuffleMergeId);
   }
 
   public static FinalizeShuffleMerge decode(ByteBuf buf) {
     String appId = Encoders.Strings.decode(buf);
+    int attemptId = buf.readInt();
     int shuffleId = buf.readInt();
-    return new FinalizeShuffleMerge(appId, shuffleId);
+    int shuffleMergeId = buf.readInt();
+    return new FinalizeShuffleMerge(appId, attemptId, shuffleId, shuffleMergeId);
   }
 }

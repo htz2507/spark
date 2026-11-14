@@ -18,6 +18,9 @@
 package org.apache.spark.sql.catalyst.analysis
 
 import java.io.File
+import java.util
+
+import scala.jdk.CollectionConverters._
 
 import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito._
@@ -27,15 +30,15 @@ import org.scalatest.matchers.must.Matchers
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.{CatalogDatabase, CatalogStorageFormat, CatalogTable, CatalogTableType, ExternalCatalog, InMemoryCatalog, SessionCatalog}
 import org.apache.spark.sql.catalyst.dsl.plans._
-import org.apache.spark.sql.connector.InMemoryTableCatalog
-import org.apache.spark.sql.connector.catalog.{CatalogManager, CatalogNotFoundException, Identifier, Table, V1Table}
+import org.apache.spark.sql.connector.catalog.{CatalogManager, Identifier, InMemoryTable, InMemoryTableCatalog, Table}
+import org.apache.spark.sql.connector.catalog.TableWritePrivilege
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 
 class TableLookupCacheSuite extends AnalysisTest with Matchers {
   private def getAnalyzer(externalCatalog: ExternalCatalog, databasePath: File): Analyzer = {
-    val conf = new SQLConf()
-    val v1Catalog = new SessionCatalog(externalCatalog, FunctionRegistry.builtin, conf)
+    val v1Catalog = new SessionCatalog(externalCatalog, FunctionRegistry.builtin)
     v1Catalog.createDatabase(
       CatalogDatabase("default", "", databasePath.toURI, Map.empty),
       ignoreIfExists = false)
@@ -48,7 +51,17 @@ class TableLookupCacheSuite extends AnalysisTest with Matchers {
       ignoreIfExists = false)
     val v2Catalog = new InMemoryTableCatalog {
       override def loadTable(ident: Identifier): Table = {
-        V1Table(externalCatalog.getTable("default", ident.name))
+        val catalogTable = externalCatalog.getTable("default", ident.name)
+        new InMemoryTable(
+          catalogTable.identifier.table,
+          catalogTable.schema,
+          Array.empty,
+          Map.empty[String, String].asJava)
+      }
+      override def loadTable(
+          ident: Identifier,
+          writePrivileges: util.Set[TableWritePrivilege]): Table = {
+        loadTable(ident)
       }
       override def name: String = CatalogManager.SESSION_CATALOG_NAME
     }
@@ -56,21 +69,31 @@ class TableLookupCacheSuite extends AnalysisTest with Matchers {
     when(catalogManager.catalog(any())).thenAnswer((invocation: InvocationOnMock) => {
       invocation.getArgument[String](0) match {
         case CatalogManager.SESSION_CATALOG_NAME => v2Catalog
-        case name =>
-          throw new CatalogNotFoundException(s"No such catalog: $name")
+        case name => throw QueryExecutionErrors.catalogNotFoundError(name)
       }
     })
     when(catalogManager.v1SessionCatalog).thenReturn(v1Catalog)
     when(catalogManager.currentCatalog).thenReturn(v2Catalog)
     when(catalogManager.currentNamespace).thenReturn(Array("default"))
+    when(catalogManager.sessionPathEntries).thenReturn(None)
+    val defaultPath = SQLConf.get.resolutionSearchPath(
+      (v2Catalog.name() +: Array("default")).toSeq)
+    when(catalogManager.sqlResolutionPathEntries(
+      any[String], any[Seq[String]], any[String], any[Seq[String]]))
+      .thenReturn(defaultPath)
+    when(catalogManager.sqlResolutionPathEntries(any[String], any[Seq[String]]))
+      .thenReturn(defaultPath)
+    when(catalogManager.resolutionPathEntriesForAnalysis(
+      any[Option[Seq[Seq[String]]]], any[Seq[String]]))
+      .thenReturn(defaultPath)
 
-    new Analyzer(catalogManager, conf)
+    new Analyzer(catalogManager)
   }
 
   test("table lookups to external catalog are cached") {
     withTempDir { tempDir =>
       val inMemoryCatalog = new InMemoryCatalog
-      val catalog = spy(inMemoryCatalog)
+      val catalog = spy[InMemoryCatalog](inMemoryCatalog)
       val analyzer = getAnalyzer(catalog, tempDir)
       reset(catalog)
       analyzer.execute(table("t1").join(table("t1")).join(table("t1")))
@@ -81,7 +104,7 @@ class TableLookupCacheSuite extends AnalysisTest with Matchers {
   test("table lookups via nested views are cached") {
     withTempDir { tempDir =>
       val inMemoryCatalog = new InMemoryCatalog
-      val catalog = spy(inMemoryCatalog)
+      val catalog = spy[InMemoryCatalog](inMemoryCatalog)
       val analyzer = getAnalyzer(catalog, tempDir)
       val viewDef = CatalogTable(
         TableIdentifier("view", Some("default")),
@@ -94,6 +117,24 @@ class TableLookupCacheSuite extends AnalysisTest with Matchers {
       reset(catalog)
       analyzer.execute(table("t1").join(table("view")).join(table("view")))
       verify(catalog, times(1)).getTable("default", "t1")
+    }
+  }
+
+  test("nested view analysis shares query-scoped caches") {
+    AnalysisContext.withNewAnalysisContext {
+      val outer = AnalysisContext.get
+      val viewDesc = CatalogTable(
+        TableIdentifier("view", Some("default")),
+        CatalogTableType.VIEW,
+        CatalogStorageFormat.empty,
+        StructType(Seq(StructField("a", IntegerType))),
+        viewText = Some("select * from t1"))
+
+      AnalysisContext.withAnalysisContext(viewDesc) {
+        assert(AnalysisContext.get.relationCache eq outer.relationCache)
+        assert(AnalysisContext.get.tableCache eq outer.tableCache)
+        assert(AnalysisContext.get.changelogCache eq outer.changelogCache)
+      }
     }
   }
 }

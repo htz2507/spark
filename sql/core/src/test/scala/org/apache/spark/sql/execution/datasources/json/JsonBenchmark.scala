@@ -17,6 +17,8 @@
 package org.apache.spark.sql.execution.datasources.json
 
 import java.io.File
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 import java.time.{Instant, LocalDate}
 
 import org.apache.spark.benchmark.Benchmark
@@ -33,21 +35,23 @@ import org.apache.spark.sql.types._
  *   1. without sbt:
  *      bin/spark-submit --class <this class> --jars <spark core test jar>,
  *        <spark catalyst test jar> <spark sql test jar>
- *   2. build/sbt "sql/test:runMain <this class>"
+ *   2. build/sbt "sql/Test/runMain <this class>"
  *   3. generate result:
- *      SPARK_GENERATE_BENCHMARK_FILES=1 build/sbt "sql/test:runMain <this class>"
+ *      SPARK_GENERATE_BENCHMARK_FILES=1 build/sbt "sql/Test/runMain <this class>"
  *      Results will be written to "benchmarks/JSONBenchmark-results.txt".
+ *
+ *   To measure only the top-level JSON array cases, run it with the "top-level-array"
+ *   argument. It skips every other case, so it must not be combined with
+ *   SPARK_GENERATE_BENCHMARK_FILES=1: the results file is truncated before the arguments
+ *   are read, so it would be left holding only the top-level array sections.
+ *   1. without sbt:
+ *      bin/spark-submit --class <this class> --jars <spark core test jar>,
+ *        <spark catalyst test jar> <spark sql test jar> top-level-array
+ *   2. build/sbt "sql/Test/runMain <this class> top-level-array"
  * }}}
  */
-
 object JsonBenchmark extends SqlBasedBenchmark {
   import spark.implicits._
-
-  private def prepareDataInfo(benchmark: Benchmark): Unit = {
-    // scalastyle:off println
-    benchmark.out.println("Preparing data for benchmarking ...")
-    // scalastyle:on println
-  }
 
   def schemaInferring(rowsNum: Int, numIters: Int): Unit = {
     val benchmark = new Benchmark("JSON schema inferring", rowsNum, output = output)
@@ -116,7 +120,7 @@ object JsonBenchmark extends SqlBasedBenchmark {
   def writeWideColumn(path: String, rowsNum: Int): StructType = {
     spark.sparkContext.range(0, rowsNum, 1)
       .map { i =>
-        val s = "abcdef0123456789ABCDEF" * 20
+        val s = "abcdef0123456789ABCDEF".repeat(20)
         s"""{"a":"$s","b": $i,"c":"$s","d":$i,"e":"$s","f":$i,"x":"$s","y":$i,"z":"$s"}"""
       }
       .toDF().write.text(path)
@@ -126,18 +130,6 @@ object JsonBenchmark extends SqlBasedBenchmark {
       .add("e", StringType).add("f", LongType)
       .add("x", StringType).add("y", LongType)
       .add("z", StringType)
-  }
-
-  def writeWideRow(path: String, rowsNum: Int): StructType = {
-    val colsNum = 1000
-    val fields = Seq.tabulate(colsNum)(i => StructField(s"col$i", IntegerType))
-    val schema = StructType(fields)
-
-    spark.range(rowsNum)
-      .select(Seq.tabulate(colsNum)(i => lit(i).as(s"col$i")): _*)
-      .write.json(path)
-
-    schema
   }
 
   def countWideColumn(rowsNum: Int, numIters: Int): Unit = {
@@ -171,7 +163,7 @@ object JsonBenchmark extends SqlBasedBenchmark {
 
     withTempPath { path =>
       prepareDataInfo(benchmark)
-      val schema = writeWideRow(path.getAbsolutePath, rowsNum)
+      val schema = writeWideRow(path.getAbsolutePath, rowsNum, 1000)
 
       benchmark.addCase("No encoding", numIters) { _ =>
         spark.read
@@ -282,7 +274,7 @@ object JsonBenchmark extends SqlBasedBenchmark {
 
     benchmark.addCase("from_json", iters) { _ =>
       val schema = new StructType().add("a", IntegerType)
-      val from_json_ds = in.select(from_json('value, schema))
+      val from_json_ds = in.select(from_json($"value", schema))
       from_json_ds.noop()
     }
 
@@ -291,9 +283,18 @@ object JsonBenchmark extends SqlBasedBenchmark {
       json_tuple_ds.noop()
     }
 
-    benchmark.addCase("get_json_object", iters) { _ =>
-      val get_json_object_ds = in.select(get_json_object($"value", "$.a"))
-      get_json_object_ds.noop()
+    benchmark.addCase("get_json_object wholestage off", iters) { _ =>
+      withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false") {
+        val get_json_object_ds = in.select(get_json_object($"value", "$.a"))
+        get_json_object_ds.noop()
+      }
+    }
+
+    benchmark.addCase("get_json_object wholestage on", iters) { _ =>
+      withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true") {
+        val get_json_object_ds = in.select(get_json_object($"value", "$.a"))
+        get_json_object_ds.noop()
+      }
     }
 
     benchmark.run()
@@ -492,6 +493,32 @@ object JsonBenchmark extends SqlBasedBenchmark {
         ds.noop()
       }
 
+      def errorTimestampStr: Dataset[String] = {
+        spark.range(0, rowsNum, 1, 1).mapPartitions { iter =>
+          iter.map { i =>
+            s"""{"timestamp":"data${i % 200}"}"""
+          }
+        }.select($"value".as("timestamp")).as[String]
+      }
+
+      readBench.addCase("infer error timestamps from Dataset[String] with default format",
+        numIters) { _ =>
+        spark.read.option("inferTimestamp", true).json(errorTimestampStr).noop()
+      }
+
+      readBench.addCase("infer error timestamps from Dataset[String] with user-provided format",
+        numIters) { _ =>
+        spark.read.option("inferTimestamp", true).option("timestampFormat",
+          "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").json(errorTimestampStr).noop()
+      }
+
+      readBench.addCase("infer error timestamps from Dataset[String] with legacy format",
+        numIters) { _ =>
+        withSQLConf(SQLConf.LEGACY_TIME_PARSER_POLICY.key -> "LEGACY") {
+          spark.read.option("inferTimestamp", true).json(errorTimestampStr).noop()
+        }
+      }
+
       readBench.run()
     }
   }
@@ -535,22 +562,90 @@ object JsonBenchmark extends SqlBasedBenchmark {
     }
   }
 
+  private def partialResultBenchmark(rowsNum: Int, numIters: Int): Unit = {
+    val benchmark = new Benchmark("Partial JSON results", rowsNum, output = output)
+    val colsNum = 1000
+
+    val fields = Seq.tabulate(colsNum)(i => StructField(s"col$i", IntegerType))
+    val schema = StructType(fields)
+
+    def data: Dataset[String] = {
+      spark.range(0, rowsNum, 1, 1).mapPartitions { iter =>
+        iter.map { i =>
+          (0 until colsNum).map { j =>
+            // Only the last column has an integer value.
+            if (j < colsNum - 1) s""""col${i}":"foo_${j}"""" else s""""col${i}":${j}"""
+          }.mkString("{", ", ", "}")
+        }
+      }.select($"value").as[String]
+    }
+
+    benchmark.addCase("parse invalid JSON", numIters) { _ =>
+      withSQLConf(SQLConf.JSON_ENABLE_PARTIAL_RESULTS.key -> "true") {
+        spark.read.schema(schema).json(data).noop()
+      }
+    }
+
+    benchmark.run()
+  }
+
+  private def topLevelArrayBenchmark(
+      rowsNum: Int,
+      payloadSize: Int,
+      numIters: Int): Unit = {
+    val payload = "x" * payloadSize
+    val document = (0 until rowsNum)
+      .map(i => s"""{"a":$i,"payload":"$payload"}""")
+      .mkString("[", ",", "]")
+    val schema = new StructType().add("a", IntegerType).add("payload", StringType)
+    val benchmark = new Benchmark(
+      s"Top-level JSON array with $payloadSize-byte payloads", rowsNum, output = output)
+
+    withTempPath { path =>
+      Files.write(path.toPath, document.getBytes(StandardCharsets.UTF_8))
+
+      Seq(false, true).foreach { enabled =>
+        benchmark.addCase(s"streaming enabled: $enabled", numIters) { _ =>
+          withSQLConf(SQLConf.JSON_STREAM_MULTILINE_TOP_LEVEL_ARRAY.key -> enabled.toString) {
+            spark.read
+              .option("multiLine", true)
+              .schema(schema)
+              .json(path.getCanonicalPath)
+              .noop()
+          }
+        }
+      }
+
+      benchmark.run()
+    }
+  }
+
   override def runBenchmarkSuite(mainArgs: Array[String]): Unit = {
     val numIters = 3
+    if (mainArgs.contains("top-level-array")) {
+      runBenchmark("Benchmark for top-level JSON array parsing") {
+        topLevelArrayBenchmark(rowsNum = 100000, payloadSize = 0, numIters = numIters)
+        topLevelArrayBenchmark(rowsNum = 1000, payloadSize = 64 * 1024, numIters = numIters)
+      }
+      return
+    }
     runBenchmark("Benchmark for performance of JSON parsing") {
-      schemaInferring(100 * 1000 * 1000, numIters)
-      countShortColumn(100 * 1000 * 1000, numIters)
-      countWideColumn(10 * 1000 * 1000, numIters)
-      countWideRow(500 * 1000, numIters)
-      selectSubsetOfColumns(10 * 1000 * 1000, numIters)
-      jsonParserCreation(10 * 1000 * 1000, numIters)
-      jsonFunctions(10 * 1000 * 1000, numIters)
-      jsonInDS(50 * 1000 * 1000, numIters)
-      jsonInFile(50 * 1000 * 1000, numIters)
-      datetimeBenchmark(rowsNum = 10 * 1000 * 1000, numIters)
+      schemaInferring(5 * 1000 * 1000, numIters)
+      countShortColumn(5 * 1000 * 1000, numIters)
+      countWideColumn(1000 * 1000, numIters)
+      countWideRow(50 * 1000, numIters)
+      selectSubsetOfColumns(1000 * 1000, numIters)
+      jsonParserCreation(1000 * 1000, numIters)
+      jsonFunctions(1000 * 1000, numIters)
+      jsonInDS(5 * 1000 * 1000, numIters)
+      jsonInFile(5 * 1000 * 1000, numIters)
+      datetimeBenchmark(rowsNum = 1000 * 1000, numIters)
       // Benchmark pushdown filters that refer to top-level columns.
       // TODO (SPARK-32325): Add benchmarks for filters with nested column attributes.
       filtersPushdownBenchmark(rowsNum = 100 * 1000, numIters)
+      partialResultBenchmark(rowsNum = 10000, numIters)
+      topLevelArrayBenchmark(rowsNum = 100000, payloadSize = 0, numIters = numIters)
+      topLevelArrayBenchmark(rowsNum = 1000, payloadSize = 64 * 1024, numIters = numIters)
     }
   }
 }

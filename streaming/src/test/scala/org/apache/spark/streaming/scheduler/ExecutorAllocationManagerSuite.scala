@@ -19,7 +19,7 @@ package org.apache.spark.streaming.scheduler
 
 import org.mockito.ArgumentMatchers.{any, eq => meq}
 import org.mockito.Mockito.{never, reset, times, verify, when}
-import org.scalatest.{BeforeAndAfterEach, PrivateMethodTester}
+import org.scalatest.PrivateMethodTester
 import org.scalatest.concurrent.Eventually.{eventually, timeout}
 import org.scalatest.time.SpanSugar._
 import org.scalatestplus.mockito.MockitoSugar
@@ -61,7 +61,7 @@ class ExecutorAllocationManagerSuite extends TestSuiteBase
     withAllocationManager(numReceivers = 1, conf = conf) {
       case (receiverTracker, allocationManager) =>
 
-      when(receiverTracker.allocatedExecutors).thenReturn(Map(1 -> Some("1")))
+      when(receiverTracker.allocatedExecutors()).thenReturn(Map(1 -> Some("1")))
 
       /** Add data point for batch processing time and verify executor allocation */
       def addBatchProcTimeAndVerifyAllocation(batchProcTimeMs: Double)(body: => Unit): Unit = {
@@ -119,13 +119,13 @@ class ExecutorAllocationManagerSuite extends TestSuiteBase
       }
 
       // Batch proc time = batch interval, should increase allocation by 1
-      addBatchProcTimeAndVerifyAllocation(batchDurationMillis) {
+      addBatchProcTimeAndVerifyAllocation(batchDurationMillis.toDouble) {
         verifyTotalRequestedExecs(Some(3)) // one already allocated, increase allocation by 1
         verifyScaledDownExec(None)
       }
 
       // Batch proc time = batch interval * 2, should increase allocation by 2
-      addBatchProcTimeAndVerifyAllocation(batchDurationMillis * 2) {
+      addBatchProcTimeAndVerifyAllocation(batchDurationMillis * 2.0) {
         verifyTotalRequestedExecs(Some(4))
         verifyScaledDownExec(None)
       }
@@ -239,7 +239,7 @@ class ExecutorAllocationManagerSuite extends TestSuiteBase
 
       reset(allocationClient)
       when(allocationClient.getExecutorIds()).thenReturn(execIds)
-      when(receiverTracker.allocatedExecutors).thenReturn(receiverExecIds)
+      when(receiverTracker.allocatedExecutors()).thenReturn(receiverExecIds)
       killExecutor(allocationManager)
       if (expectedKilledExec.nonEmpty) {
         verify(allocationClient, times(1)).killExecutor(meq(expectedKilledExec.get))

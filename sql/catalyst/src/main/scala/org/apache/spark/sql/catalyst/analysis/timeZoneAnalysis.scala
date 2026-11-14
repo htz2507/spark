@@ -16,10 +16,11 @@
  */
 package org.apache.spark.sql.catalyst.analysis
 
+import org.apache.spark.sql.catalyst.SQLConfHelper
 import org.apache.spark.sql.catalyst.expressions.{Cast, Expression, ListQuery, TimeZoneAwareExpression}
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
-import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.catalyst.trees.TreePattern.TIME_ZONE_AWARE_EXPRESSION
 import org.apache.spark.sql.types.DataType
 
 /**
@@ -38,19 +39,18 @@ object ResolveTimeZone extends Rule[LogicalPlan] {
   }
 
   override def apply(plan: LogicalPlan): LogicalPlan =
-    plan.resolveExpressions(transformTimeZoneExprs)
+    plan.resolveExpressionsWithPruning(
+      _.containsPattern(TIME_ZONE_AWARE_EXPRESSION), ruleId)(transformTimeZoneExprs)
 
-  def resolveTimeZones(e: Expression): Expression = e.transform(transformTimeZoneExprs)
+  def resolveTimeZones(e: Expression): Expression = e.transformWithPruning(
+    _.containsPattern(TIME_ZONE_AWARE_EXPRESSION))(transformTimeZoneExprs)
 }
 
 /**
  * Mix-in trait for constructing valid [[Cast]] expressions.
  */
 trait CastSupport {
-  /**
-   * Configuration used to create a valid cast expression.
-   */
-  def conf: SQLConf
+  self: SQLConfHelper =>
 
   /**
    * Create a Cast expression with the session local time zone.

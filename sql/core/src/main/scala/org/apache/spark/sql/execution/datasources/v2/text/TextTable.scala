@@ -19,7 +19,7 @@ package org.apache.spark.sql.execution.datasources.v2.text
 import org.apache.hadoop.fs.FileStatus
 
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.connector.write.{LogicalWriteInfo, WriteBuilder}
+import org.apache.spark.sql.connector.write.{LogicalWriteInfo, Write, WriteBuilder}
 import org.apache.spark.sql.execution.datasources.FileFormat
 import org.apache.spark.sql.execution.datasources.v2.FileTable
 import org.apache.spark.sql.types.{DataType, StringType, StructField, StructType}
@@ -34,15 +34,24 @@ case class TextTable(
     fallbackFileFormat: Class[_ <: FileFormat])
   extends FileTable(sparkSession, options, paths, userSpecifiedSchema) {
   override def newScanBuilder(options: CaseInsensitiveStringMap): TextScanBuilder =
-    TextScanBuilder(sparkSession, fileIndex, schema, dataSchema, options)
+    TextScanBuilder(sparkSession, fileIndex, schema, dataSchema, mergedOptions(options))
 
   override def inferSchema(files: Seq[FileStatus]): Option[StructType] =
-    Some(StructType(Seq(StructField("value", StringType))))
+    Some(StructType(Array(StructField("value", StringType))))
 
-  override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder =
-    new TextWriteBuilder(paths, formatName, supportsDataType, info)
+  override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder = {
+    new WriteBuilder {
+      override def build(): Write =
+        TextWrite(paths, formatName, supportsDataType, mergedWriteInfo(info))
+    }
+  }
 
-  override def supportsDataType(dataType: DataType): Boolean = dataType == StringType
+  override def supportsDataType(dataType: DataType): Boolean =
+    dataType.isInstanceOf[StringType]
 
   override def formatName: String = "Text"
+
+  // The schema is a single `value` column, and every line -- or every file under `wholetext` --
+  // becomes a row, so there is no parse step whose outcome a wider column set could change.
+  override protected def supportsScanMerging: Boolean = true
 }

@@ -19,7 +19,7 @@ package org.apache.spark.sql.execution
 
 import java.util.Collections
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
 import org.apache.spark.broadcast.Broadcast
@@ -31,8 +31,9 @@ import org.apache.spark.sql.catalyst.expressions.Attribute
 import org.apache.spark.sql.catalyst.expressions.codegen.{ByteCodeStats, CodeFormatter, CodegenContext, CodeGenerator, ExprCode}
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.catalyst.trees.TreeNodeRef
-import org.apache.spark.sql.catalyst.util.StringUtils.StringConcat
-import org.apache.spark.sql.execution.streaming.{StreamExecution, StreamingQueryWrapper}
+import org.apache.spark.sql.catalyst.util.StringConcat
+import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, QueryStageExec}
+import org.apache.spark.sql.execution.streaming.runtime.{StreamExecution, StreamingQueryWrapper}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.streaming.StreamingQuery
 import org.apache.spark.sql.vectorized.ColumnarBatch
@@ -100,20 +101,38 @@ package object debug {
   }
 
   /**
+   * The whole-stage codegen subtrees of `plan` and of its subqueries, in stage id order. The walk
+   * follows an adaptive plan into its current executed plan and its query stages.
+   */
+  private[sql] def codegenSubtrees(plan: SparkPlan): Seq[WholeStageCodegenExec] = {
+    val codegenSubtrees = new collection.mutable.HashSet[WholeStageCodegenExec]()
+
+    def findSubtrees(plan: SparkPlan): Unit = {
+      plan foreach {
+        case s: WholeStageCodegenExec =>
+          codegenSubtrees += s
+        case p: AdaptiveSparkPlanExec =>
+          // Find subtrees from current executed plan of AQE.
+          findSubtrees(p.executedPlan)
+        case s: QueryStageExec =>
+          findSubtrees(s.plan)
+        case s =>
+          s.subqueries.foreach(findSubtrees)
+      }
+    }
+
+    findSubtrees(plan)
+    codegenSubtrees.toSeq.sortBy(_.codegenStageId)
+  }
+
+  /**
    * Get WholeStageCodegenExec subtrees and the codegen in a query plan
    *
    * @param plan the query plan for codegen
    * @return Sequence of WholeStageCodegen subtrees and corresponding codegen
    */
   def codegenStringSeq(plan: SparkPlan): Seq[(String, String, ByteCodeStats)] = {
-    val codegenSubtrees = new collection.mutable.HashSet[WholeStageCodegenExec]()
-    plan transform {
-      case s: WholeStageCodegenExec =>
-        codegenSubtrees += s
-        s
-      case s => s
-    }
-    codegenSubtrees.toSeq.sortBy(_.codegenStageId).map { subtree =>
+    codegenSubtrees(plan).map { subtree =>
       val (_, source) = subtree.doCodeGen()
       val codeStats = try {
         CodeGenerator.compile(source)._2
@@ -195,24 +214,32 @@ package object debug {
     }
   }
 
-  case class DebugExec(child: SparkPlan) extends UnaryExecNode with CodegenSupport {
-    def output: Seq[Attribute] = child.output
 
-    class SetAccumulator[T] extends AccumulatorV2[T, java.util.Set[T]] {
-      private val _set = Collections.synchronizedSet(new java.util.HashSet[T]())
-      override def isZero: Boolean = _set.isEmpty
-      override def copy(): AccumulatorV2[T, java.util.Set[T]] = {
-        val newAcc = new SetAccumulator[T]()
-        newAcc._set.addAll(_set)
-        newAcc
-      }
-      override def reset(): Unit = _set.clear()
-      override def add(v: T): Unit = _set.add(v)
-      override def merge(other: AccumulatorV2[T, java.util.Set[T]]): Unit = {
-        _set.addAll(other.value)
-      }
-      override def value: java.util.Set[T] = _set
+  class SetAccumulator[T] extends AccumulatorV2[T, java.util.Set[T]] {
+    private val _set = Collections.synchronizedSet(new java.util.HashSet[T]())
+
+    override def isZero: Boolean = _set.isEmpty
+
+    override def copy(): AccumulatorV2[T, java.util.Set[T]] = {
+      val newAcc = new SetAccumulator[T]()
+      newAcc._set.addAll(_set)
+      newAcc
     }
+
+    override def reset(): Unit = _set.clear()
+
+    override def add(v: T): Unit = _set.add(v)
+
+    override def merge(other: AccumulatorV2[T, java.util.Set[T]]): Unit = {
+      _set.addAll(other.value)
+    }
+
+    override def value: java.util.Set[T] = _set
+  }
+
+  case class DebugExec(child: SparkPlan)
+      extends UnaryExecNode with CodegenSupport with SafeForKWayMerge {
+    def output: Seq[Attribute] = child.output
 
     /**
      * A collection of metrics for each column of output.
@@ -239,23 +266,13 @@ package object debug {
     }
 
     protected override def doExecute(): RDD[InternalRow] = {
-      child.execute().mapPartitions { iter =>
-        new Iterator[InternalRow] {
-          def hasNext: Boolean = iter.hasNext
-
-          def next(): InternalRow = {
-            val currentRow = iter.next()
-            tupleCount.add(1)
-            var i = 0
-            while (i < numColumns) {
-              val value = currentRow.get(i, output(i).dataType)
-              if (value != null) {
-                columnStats(i).elementTypes.add(value.getClass.getName)
-              }
-              i += 1
-            }
-            currentRow
-          }
+      val evaluatorFactory = new DebugEvaluatorFactory(tupleCount, numColumns,
+        columnStats.map(_.elementTypes), output)
+      if (conf.usePartitionEvaluator) {
+        child.execute().mapPartitionsWithEvaluator(evaluatorFactory)
+      } else {
+        child.execute().mapPartitionsWithIndex { (index, iter) =>
+          evaluatorFactory.createEvaluator().eval(index, iter)
         }
       }
     }
@@ -283,5 +300,8 @@ package object debug {
     }
 
     override def supportsColumnar: Boolean = child.supportsColumnar
+
+    override protected def withNewChildInternal(newChild: SparkPlan): DebugExec =
+      copy(child = newChild)
   }
 }

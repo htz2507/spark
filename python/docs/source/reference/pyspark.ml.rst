@@ -16,11 +16,14 @@
     under the License.
 
 
-ML
-==
+MLlib (DataFrame-based)
+=======================
 
-ML Pipeline APIs
-----------------
+.. note::
+   From Apache Spark 4.0.0, all builtin algorithms support Spark Connect.
+
+Pipeline APIs
+-------------
 
 .. currentmodule:: pyspark.ml
 
@@ -61,8 +64,6 @@ Feature
     :template: autosummary/class_with_docs.rst
     :toctree: api/
 
-    ANOVASelector
-    ANOVASelectorModel
     Binarizer
     BucketedRandomProjectionLSH
     BucketedRandomProjectionLSHModel
@@ -74,8 +75,6 @@ Feature
     DCT
     ElementwiseProduct
     FeatureHasher
-    FValueSelector
-    FValueSelectorModel
     HashingTF
     IDF
     IDFModel
@@ -108,7 +107,11 @@ Feature
     StopWordsRemover
     StringIndexer
     StringIndexerModel
+    TargetEncoder
+    TargetEncoderModel
     Tokenizer
+    UnivariateFeatureSelector
+    UnivariateFeatureSelectorModel
     VarianceThresholdSelector
     VarianceThresholdSelectorModel
     VectorAssembler
@@ -188,15 +191,17 @@ Clustering
     PowerIterationClustering
 
 
-ML Functions
-----------------------------
+Functions
+---------
 
 .. currentmodule:: pyspark.ml.functions
 
 .. autosummary::
     :toctree: api/
 
+    array_to_vector
     vector_to_array
+    predict_batch_udf
 
 
 Vector and Matrix
@@ -271,10 +276,8 @@ Statistics
     :template: autosummary/class_with_docs.rst
     :toctree: api/
 
-    ANOVATest
     ChiSquareTest
     Correlation
-    FValueTest
     KolmogorovSmirnovTest
     MultivariateGaussian
     Summarizer
@@ -340,6 +343,26 @@ Image
 
     ImageSchema
     _ImageSchema
+
+
+Distributor
+-----------
+
+
+.. currentmodule:: pyspark.ml.torch.distributor
+
+.. autosummary::
+    :template: autosummary/class_with_docs.rst
+    :toctree: api/
+
+    TorchDistributor
+
+.. currentmodule:: pyspark.ml.deepspeed.deepspeed_distributor
+.. autosummary::
+    :template: autosummary/class_with_docs.rst
+    :toctree: api/
+
+    DeepspeedTorchDistributor
 
 
 Utilities

@@ -19,11 +19,11 @@ SELECT
 FROM testData;
 
 -- count with multiple expressions
-SELECT count(a, b), count(b, a), count(testData.*) FROM testData;
+SELECT count(a, b), count(b, a), count(testData.*, testData.*) FROM testData;
 
 -- distinct count with multiple expressions
 SELECT
-  count(DISTINCT a, b), count(DISTINCT b, a), count(DISTINCT *), count(DISTINCT testData.*)
+  count(DISTINCT a, b), count(DISTINCT b, a), count(DISTINCT *), count(DISTINCT testData.*, testData.*)
 FROM testData;
 
 -- distinct count with multiple literals
@@ -35,3 +35,35 @@ SELECT count(DISTINCT a), count(DISTINCT 3,2) FROM testData;
 SELECT count(DISTINCT a), count(DISTINCT 2), count(DISTINCT 2,3) FROM testData;
 SELECT count(DISTINCT a), count(DISTINCT 2), count(DISTINCT 3,2) FROM testData;
 SELECT count(distinct 0.8), percentile_approx(distinct a, 0.8) FROM testData;
+
+-- legacy behavior: allow calling function count without parameters
+set spark.sql.legacy.allowParameterlessCount=true;
+SELECT count() FROM testData;
+
+-- count without expressions
+set spark.sql.legacy.allowParameterlessCount=false;
+SELECT count() FROM testData;
+
+-- legacy behavior: allow count(testData.*)
+set spark.sql.legacy.allowStarWithSingleTableIdentifierInCount=true;
+SELECT count(testData.*) FROM testData;
+
+-- count with a single tblName.* as parameter
+set spark.sql.legacy.allowStarWithSingleTableIdentifierInCount=false;
+SELECT count(testData.*) FROM testData;
+
+-- Stars with target should be disallowed in COUNT function, also with DISTINCT, a table alias, a
+-- different case, in HAVING and as a window function
+SELECT count(DISTINCT testData.*) FROM testData;
+SELECT count(DISTINCT t.*) FROM testData t;
+SELECT count(DISTINCT TESTDATA.*) FROM testData;
+SELECT a FROM testData GROUP BY a HAVING count(DISTINCT testData.*) > 0;
+SELECT count(testData.*) OVER () FROM testData;
+-- A star with target is allowed next to other arguments
+SELECT count(DISTINCT testData.*, a) FROM testData;
+
+-- legacy behavior: allow count(DISTINCT testData.*)
+set spark.sql.legacy.allowStarWithSingleTableIdentifierInCount=true;
+SELECT count(DISTINCT testData.*) FROM testData;
+SELECT count(DISTINCT t.*) FROM testData t;
+set spark.sql.legacy.allowStarWithSingleTableIdentifierInCount=false;

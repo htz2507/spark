@@ -17,13 +17,36 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
+import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, AttributeSet}
 import org.apache.spark.sql.catalyst.optimizer.SimpleTestOptimizer
 import org.apache.spark.sql.catalyst.parser.CatalystSqlParser
-import org.apache.spark.sql.catalyst.plans.logical.{EventTimeWatermark, Filter, LeafNode, LocalRelation}
-import org.apache.spark.sql.types.{IntegerType, MetadataBuilder, TimestampType}
+import org.apache.spark.sql.catalyst.plans.logical.{EventTimeWatermark, Filter, LeafNode, Statistics}
+import org.apache.spark.sql.types.{IntegerType, LongType, MetadataBuilder, TimestampType}
 
 class StreamingJoinHelperSuite extends AnalysisTest {
+
+  test("state watermark extraction preserves arithmetic term multiplicity") {
+    val leftTime = AttributeReference("leftTime", TimestampType)()
+    val metadata = new MetadataBuilder().putLong(EventTimeWatermark.delayKey, 1000).build()
+    val rightTime = AttributeReference("rightTime", TimestampType, metadata = metadata)()
+    val left = leftTime.cast(LongType)
+    val right = rightTime.cast(LongType)
+
+    val cases = Seq(
+      (left > right + 2 + 2, Some(14000L)),
+      (left > right - 2 - 2, Some(6000L)),
+      (left + left > right, None),
+      (left > right + right, None),
+      (left > right - right, None))
+    cases.foreach { case (condition, expected) =>
+      withClue(condition.sql) {
+        assert(StreamingJoinHelper.getStateValueWatermark(
+          AttributeSet(Seq(leftTime)), AttributeSet(Seq(rightTime)),
+          Some(condition), Some(10000L)) === expected)
+      }
+    }
+  }
 
   test("extract watermark from time condition") {
     val attributesToFindConstraintFor = Seq(
@@ -39,6 +62,8 @@ class StreamingJoinHelperSuite extends AnalysisTest {
     case class DummyLeafNode() extends LeafNode {
       override def output: Seq[Attribute] =
         attributesToFindConstraintFor ++ attributesWithWatermark
+      // override computeStats to avoid UnsupportedOperationException.
+      override def computeStats(): Statistics = Statistics(sizeInBytes = BigInt(0))
     }
 
     def watermarkFrom(
@@ -85,6 +110,18 @@ class StreamingJoinHelperSuite extends AnalysisTest {
     assert(watermarkFrom("rightTime < leftTime - interval 3 second") === Some(13000))
     assert(watermarkFrom("rightTime - interval 1 second < leftTime - interval 3 second")
       === Some(12000))
+
+    assert(watermarkFrom("leftTime > rightTime + interval '0 00:00:01' day to second")
+      === Some(11000))
+    assert(watermarkFrom("leftTime + interval '00:00:02' hour to second > rightTime ")
+      === Some(8000))
+    assert(watermarkFrom("leftTime > rightTime - interval '00:03' minute to second")
+      === Some(7000))
+    assert(watermarkFrom("rightTime < leftTime - interval '1 20:30:40' day to second")
+      === Some(160250000))
+    assert(watermarkFrom(
+      "rightTime - interval 1 second < leftTime - interval '20:15:32' hour to second")
+      === Some(72941000))
 
     // Test with casted long type + constants on either side of equation
     // Note: long type and constants commute, so more combinations to test.

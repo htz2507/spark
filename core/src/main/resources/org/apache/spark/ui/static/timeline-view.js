@@ -15,6 +15,31 @@
  * limitations under the License.
  */
 
+/* global $, vis, uiRoot, appBasePath */
+/* eslint-disable no-unused-vars */
+const xAxisFormat = {
+  minorLabels: {
+    millisecond:'SSS',
+    second:     'ss',
+    minute:     'mm',
+    hour:       'HH',
+    weekday:    'DD',
+    day:        'DD',
+    month:      'MM',
+    year:       'YYYY'
+  },
+  majorLabels: {
+    millisecond:'YYYY/MM/DD HH:mm:ss',
+    second:     'YYYY/MM/DD HH:mm',
+    minute:     'YYYY/MM/DD HH',
+    hour:       'YYYY/MM/DD',
+    weekday:    'YYYY/MM',
+    day:        'YYYY/MM',
+    month:      'YYYY',
+    year:       ''
+  }
+}
+
 function drawApplicationTimeline(groupArray, eventObjArray, startTime, offset) {
   var groups = new vis.DataSet(groupArray);
   var items = new vis.DataSet(eventObjArray);
@@ -31,14 +56,19 @@ function drawApplicationTimeline(groupArray, eventObjArray, startTime, offset) {
     locale: "en",
     moment: function (date) {
       return vis.moment(date).utcOffset(offset);
+    },
+    format: xAxisFormat,
+    xss: {
+      disabled: false,
+      filterOptions: {
+        whiteList: { svg: ['width', 'height', 'class'], div: ['class', 'style', 'data-bs-toggle', 'data-bs-placement',
+          'data-bs-html', 'data-bs-container', 'data-title', 'data-original-title', 'title'],
+        text: ['x', 'y'], rect: ['x', 'y', 'class', 'width', 'height', 'rx', 'ry'],},
+      },
     }
   };
 
-  var applicationTimeline = new vis.Timeline(container);
-  applicationTimeline.setOptions(options);
-  applicationTimeline.setGroups(groups);
-  applicationTimeline.setItems(items);
-
+  var applicationTimeline = new vis.Timeline(container, items, groups, options);
   setupZoomable("#application-timeline-zoom-lock", applicationTimeline);
   setupExecutorEventAction();
 
@@ -63,11 +93,13 @@ function drawApplicationTimeline(groupArray, eventObjArray, startTime, offset) {
       $(this).hover(
         function() {
           $(getSelectorForJobEntry(getIdForJobEntry(this))).addClass("corresponding-item-hover");
-          $($(this).find("div.application-timeline-content")[0]).tooltip("show");
+          var el = $($(this).find("div.application-timeline-content")[0])[0];
+          var tt = bootstrap.Tooltip.getOrCreateInstance(el, {container: "body"}); tt.show();
         },
         function() {
           $(getSelectorForJobEntry(getIdForJobEntry(this))).removeClass("corresponding-item-hover");
-          $($(this).find("div.application-timeline-content")[0]).tooltip("hide");
+          var el = $($(this).find("div.application-timeline-content")[0])[0];
+          var tt = bootstrap.Tooltip.getInstance(el); if (tt) tt.hide();
         }
       );
     });
@@ -119,13 +151,19 @@ function drawJobTimeline(groupArray, eventObjArray, startTime, offset) {
     locale: "en",
     moment: function (date) {
       return vis.moment(date).utcOffset(offset);
+    },
+    format: xAxisFormat,
+    xss: {
+      disabled: false,
+      filterOptions: {
+        whiteList: { svg: ['width', 'height', 'class'], div: ['class', 'style', 'data-bs-toggle', 'data-bs-placement',
+          'data-bs-html', 'data-bs-container', 'data-title', 'data-original-title', 'title'],
+        text: ['x', 'y'], rect: ['x', 'y', 'class', 'width', 'height', 'rx', 'ry'],},
+      },
     }
   };
 
-  var jobTimeline = new vis.Timeline(container);
-  jobTimeline.setOptions(options);
-  jobTimeline.setGroups(groups);
-  jobTimeline.setItems(items);
+  var jobTimeline = new vis.Timeline(container, items, groups, options);
 
   setupZoomable("#job-timeline-zoom-lock", jobTimeline);
   setupExecutorEventAction();
@@ -153,12 +191,16 @@ function drawJobTimeline(groupArray, eventObjArray, startTime, offset) {
         function() {
           $(getSelectorForStageEntry(getStageIdAndAttemptForStageEntry(this)))
             .addClass("corresponding-item-hover");
-          $($(this).find("div.job-timeline-content")[0]).tooltip("show");
+          $($(this).find("div.job-timeline-content")[0]).each(function() {
+            var tt = bootstrap.Tooltip.getOrCreateInstance(this, {container: "body"}); tt.show();
+          });
         },
         function() {
           $(getSelectorForStageEntry(getStageIdAndAttemptForStageEntry(this)))
             .removeClass("corresponding-item-hover");
-          $($(this).find("div.job-timeline-content")[0]).tooltip("hide");
+          $($(this).find("div.job-timeline-content")[0]).each(function() {
+            var tt = bootstrap.Tooltip.getInstance(this); if (tt) tt.hide();
+          });
         }
       );
     });
@@ -212,13 +254,19 @@ function drawTaskAssignmentTimeline(groupArray, eventObjArray, minLaunchTime, ma
     locale: "en",
     moment: function (date) {
       return vis.moment(date).utcOffset(offset);
+    },
+    format: xAxisFormat,
+    xss: {
+      disabled: false,
+      filterOptions: {
+        whiteList: { svg: ['width', 'height', 'class'], div: ['class', 'style', 'data-bs-toggle', 'data-bs-placement',
+          'data-bs-html', 'data-bs-container', 'data-title', 'data-original-title', 'title'],
+        text: ['x', 'y'], rect: ['x', 'y', 'class', 'width', 'height', 'rx', 'ry'],},
+      },
     }
   };
 
-  var taskTimeline = new vis.Timeline(container);
-  taskTimeline.setOptions(options);
-  taskTimeline.setGroups(groups);
-  taskTimeline.setItems(items);
+  var taskTimeline = new vis.Timeline(container, items, groups, options);
 
   // If a user zooms while a tooltip is displayed, the user may zoom such that the cursor is no
   // longer over the task that the tooltip corresponds to. So, when a user zooms, we should hide
@@ -234,7 +282,7 @@ function drawTaskAssignmentTimeline(groupArray, eventObjArray, minLaunchTime, ma
   }, ".task-assignment-timeline-content");
   taskTimeline.on("rangechange", function(prop) {
     if (currentDisplayedTooltip !== null) {
-      $(currentDisplayedTooltip).tooltip("hide");
+      var tt = bootstrap.Tooltip.getInstance(currentDisplayedTooltip); if (tt) tt.hide();
     }
   });
 
@@ -249,7 +297,7 @@ function drawTaskAssignmentTimeline(groupArray, eventObjArray, minLaunchTime, ma
     var visibilityState = status ? "" : "none";
     $("#task-assignment-timeline").css("display", visibilityState);
 
-     // Switch the class of the arrow from open to closed.
+    // Switch the class of the arrow from open to closed.
     $(this).find(".expand-task-assignment-timeline-arrow").toggleClass("arrow-open");
     $(this).find(".expand-task-assignment-timeline-arrow").toggleClass("arrow-closed");
 
@@ -272,14 +320,17 @@ function setupExecutorEventAction() {
   $(".vis-item.vis-box.executor").each(function () {
     $(this).hover(
       function() {
-        $($(this).find(".executor-event-content")[0]).tooltip("show");
+        var el = $($(this).find(".executor-event-content")[0])[0];
+        var tt = bootstrap.Tooltip.getOrCreateInstance(el, {container: "body"}); tt.show();
       },
       function() {
-        $($(this).find(".executor-event-content")[0]).tooltip("hide");
+        var el = $($(this).find(".executor-event-content")[0])[0];
+        var tt = bootstrap.Tooltip.getInstance(el); if (tt) tt.hide();
       }
     );
   });
 }
+/* eslint-enable no-unused-vars */
 
 function setupZoomable(id, timeline) {
   $(id + ' > input[type="checkbox"]').click(function() {

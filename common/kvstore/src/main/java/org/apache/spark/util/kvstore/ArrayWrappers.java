@@ -19,7 +19,7 @@ package org.apache.spark.util.kvstore;
 
 import java.util.Arrays;
 
-import com.google.common.base.Preconditions;
+import org.apache.spark.network.util.JavaUtils;
 
 /**
  * A factory for array wrappers so that arrays can be used as keys in a map, sorted or not.
@@ -38,16 +38,17 @@ class ArrayWrappers {
 
   @SuppressWarnings("unchecked")
   public static Comparable<Object> forArray(Object a) {
-    Preconditions.checkArgument(a.getClass().isArray());
+    JavaUtils.checkArgument(a.getClass().isArray(), "Input should be an array");
     Comparable<?> ret;
-    if (a instanceof int[]) {
-      ret = new ComparableIntArray((int[]) a);
-    } else if (a instanceof long[]) {
-      ret = new ComparableLongArray((long[]) a);
-    } else if (a instanceof byte[]) {
-      ret = new ComparableByteArray((byte[]) a);
+    if (a instanceof int[] ia) {
+      ret = new ComparableIntArray(ia);
+    } else if (a instanceof long[] la) {
+      ret = new ComparableLongArray(la);
+    } else if (a instanceof byte[] ba) {
+      ret = new ComparableByteArray(ba);
     } else {
-      Preconditions.checkArgument(!a.getClass().getComponentType().isPrimitive());
+      JavaUtils.checkArgument(!a.getClass().getComponentType().isPrimitive(),
+        "Array element is primitive");
       ret = new ComparableObjectArray((Object[]) a);
     }
     return (Comparable<Object>) ret;
@@ -63,32 +64,24 @@ class ArrayWrappers {
 
     @Override
     public boolean equals(Object other) {
-      if (!(other instanceof ComparableIntArray)) {
+      if (!(other instanceof ComparableIntArray comparableIntArray)) {
         return false;
       }
-      return Arrays.equals(array, ((ComparableIntArray) other).array);
+      return Arrays.equals(array, comparableIntArray.array);
     }
 
     @Override
     public int hashCode() {
       int code = 0;
-      for (int i = 0; i < array.length; i++) {
-        code = (code * 31) + array[i];
+      for (int j : array) {
+        code = (code * 31) + j;
       }
       return code;
     }
 
     @Override
     public int compareTo(ComparableIntArray other) {
-      int len = Math.min(array.length, other.array.length);
-      for (int i = 0; i < len; i++) {
-        int diff = array[i] - other.array[i];
-        if (diff != 0) {
-          return diff;
-        }
-      }
-
-      return array.length - other.array.length;
+      return Arrays.compare(array, other.array);
     }
   }
 
@@ -102,32 +95,24 @@ class ArrayWrappers {
 
     @Override
     public boolean equals(Object other) {
-      if (!(other instanceof ComparableLongArray)) {
+      if (!(other instanceof ComparableLongArray comparableLongArray)) {
         return false;
       }
-      return Arrays.equals(array, ((ComparableLongArray) other).array);
+      return Arrays.equals(array, comparableLongArray.array);
     }
 
     @Override
     public int hashCode() {
       int code = 0;
-      for (int i = 0; i < array.length; i++) {
-        code = (code * 31) + (int) array[i];
+      for (long l : array) {
+        code = (code * 31) + (int) l;
       }
       return code;
     }
 
     @Override
     public int compareTo(ComparableLongArray other) {
-      int len = Math.min(array.length, other.array.length);
-      for (int i = 0; i < len; i++) {
-        long diff = array[i] - other.array[i];
-        if (diff != 0) {
-          return diff > 0 ? 1 : -1;
-        }
-      }
-
-      return array.length - other.array.length;
+      return Arrays.compare(array, other.array);
     }
   }
 
@@ -141,32 +126,24 @@ class ArrayWrappers {
 
     @Override
     public boolean equals(Object other) {
-      if (!(other instanceof ComparableByteArray)) {
+      if (!(other instanceof ComparableByteArray comparableByteArray)) {
         return false;
       }
-      return Arrays.equals(array, ((ComparableByteArray) other).array);
+      return Arrays.equals(array, comparableByteArray.array);
     }
 
     @Override
     public int hashCode() {
       int code = 0;
-      for (int i = 0; i < array.length; i++) {
-        code = (code * 31) + array[i];
+      for (byte b : array) {
+        code = (code * 31) + b;
       }
       return code;
     }
 
     @Override
     public int compareTo(ComparableByteArray other) {
-      int len = Math.min(array.length, other.array.length);
-      for (int i = 0; i < len; i++) {
-        int diff = array[i] - other.array[i];
-        if (diff != 0) {
-          return diff;
-        }
-      }
-
-      return array.length - other.array.length;
+      return Arrays.compare(array, other.array);
     }
   }
 
@@ -180,17 +157,17 @@ class ArrayWrappers {
 
     @Override
     public boolean equals(Object other) {
-      if (!(other instanceof ComparableObjectArray)) {
+      if (!(other instanceof ComparableObjectArray comparableObjectArray)) {
         return false;
       }
-      return Arrays.equals(array, ((ComparableObjectArray) other).array);
+      return Arrays.equals(array, comparableObjectArray.array);
     }
 
     @Override
     public int hashCode() {
       int code = 0;
-      for (int i = 0; i < array.length; i++) {
-        code = (code * 31) + array[i].hashCode();
+      for (Object o : array) {
+        code = (code * 31) + o.hashCode();
       }
       return code;
     }
@@ -200,7 +177,7 @@ class ArrayWrappers {
     public int compareTo(ComparableObjectArray other) {
       int len = Math.min(array.length, other.array.length);
       for (int i = 0; i < len; i++) {
-        int diff = ((Comparable<Object>) array[i]).compareTo((Comparable<Object>) other.array[i]);
+        int diff = ((Comparable<Object>) array[i]).compareTo(other.array[i]);
         if (diff != 0) {
           return diff;
         }

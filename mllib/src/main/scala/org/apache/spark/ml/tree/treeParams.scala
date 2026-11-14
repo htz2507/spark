@@ -24,7 +24,7 @@ import scala.util.Try
 import org.apache.spark.annotation.Since
 import org.apache.spark.ml.PredictorParams
 import org.apache.spark.ml.classification.ProbabilisticClassifierParams
-import org.apache.spark.ml.linalg.VectorUDT
+import org.apache.spark.ml.linalg.SQLDataTypes
 import org.apache.spark.ml.param._
 import org.apache.spark.ml.param.shared._
 import org.apache.spark.ml.util.SchemaUtils
@@ -39,7 +39,7 @@ import org.apache.spark.sql.types.{DataType, DoubleType, StructType}
  * Note: Marked as private since this may be made public in the future.
  */
 private[ml] trait DecisionTreeParams extends PredictorParams
-  with HasCheckpointInterval with HasSeed with HasWeightCol {
+  with HasCheckpointInterval with HasSeed with HasWeightCol with HasIntermediateStorageLevel {
 
   /**
    * Leaf indices column name.
@@ -60,8 +60,9 @@ private[ml] trait DecisionTreeParams extends PredictorParams
    */
   final val maxDepth: IntParam =
     new IntParam(this, "maxDepth", "Maximum depth of the tree. (Nonnegative)" +
-      " E.g., depth 0 means 1 leaf node; depth 1 means 1 internal node + 2 leaf nodes.",
-      ParamValidators.gtEq(0))
+      " E.g., depth 0 means 1 leaf node; depth 1 means 1 internal node + 2 leaf nodes." +
+      " Must be in range [0, 30].",
+      ParamValidators.inRange(0, 30))
 
   /**
    * Maximum number of bins used for discretizing continuous features and for choosing how to split
@@ -210,10 +211,27 @@ private[ml] trait TreeClassifierParams extends Params {
     (value: String) =>
       TreeClassifierParams.supportedImpurities.contains(value.toLowerCase(Locale.ROOT)))
 
-  setDefault(impurity -> "gini")
+  /**
+   * If true, the trained tree will undergo a pruning process after training, in which sibling
+   * leaf nodes with the same prediction are merged into their parent. The resulting tree will
+   * be smaller and have faster predictions. Class probabilities remain available after pruning.
+   * If false, no pruning is applied after training.
+   * (default = true)
+   * @group param
+   */
+  final val pruneTree: BooleanParam = new BooleanParam(this, "pruneTree", "" +
+    "If true, the trained tree will undergo a pruning process after training, in which sibling" +
+    " leaf nodes with the same prediction are merged into their parent. The resulting tree will" +
+    " be smaller and have faster predictions. Class probabilities remain available after pruning." +
+    " If false, no pruning is applied after training."
+  )
+
+  setDefault(impurity -> "gini", pruneTree -> true)
 
   /** @group getParam */
   final def getImpurity: String = $(impurity).toLowerCase(Locale.ROOT)
+  /** @group getParam */
+  final def getPruneTree: Boolean = $(pruneTree)
 
   /** Convert new impurity to old impurity. */
   private[ml] def getOldImpurity: OldImpurity = {
@@ -402,7 +420,7 @@ private[ml] trait TreeEnsembleClassifierParams
       featuresDataType: DataType): StructType = {
     var outputSchema = super.validateAndTransformSchema(schema, fitting, featuresDataType)
     if ($(leafCol).nonEmpty) {
-      outputSchema = SchemaUtils.appendColumn(outputSchema, $(leafCol), new VectorUDT)
+      outputSchema = SchemaUtils.appendColumn(outputSchema, $(leafCol), SQLDataTypes.VectorType)
     }
     outputSchema
   }
@@ -420,7 +438,7 @@ private[ml] trait TreeEnsembleRegressorParams
       featuresDataType: DataType): StructType = {
     var outputSchema = super.validateAndTransformSchema(schema, fitting, featuresDataType)
     if ($(leafCol).nonEmpty) {
-      outputSchema = SchemaUtils.appendColumn(outputSchema, $(leafCol), new VectorUDT)
+      outputSchema = SchemaUtils.appendColumn(outputSchema, $(leafCol), SQLDataTypes.VectorType)
     }
     outputSchema
   }
